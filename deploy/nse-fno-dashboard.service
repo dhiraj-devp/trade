@@ -1,0 +1,15 @@
+[Unit]
+Description=NSE F&O scanner dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nse-fno-scanner
+ExecStart=/opt/nse-fno-scanner/.venv/bin/streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+Restart=on-failure
+RestartSec=5
+User=nse-scanner
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

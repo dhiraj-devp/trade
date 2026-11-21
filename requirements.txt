@@ -1,0 +1,7 @@
+streamlit>=1.40
+pandas>=2.2,<3
+requests>=2.32
+growwapi>=1.5
+pyotp>=2.9
+firebase-admin>=6.5
+pytest>=8
