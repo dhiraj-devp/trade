@@ -1,6 +1,6 @@
 """Decision helpers used by the background scanner.
 
-These functions do not fetch data and do not create a price when one is missing.
+These functions do not fetch data and do not create a price when one is missing..
 """
 
 from __future__ import annotations
