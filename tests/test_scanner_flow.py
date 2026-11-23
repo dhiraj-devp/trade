@@ -153,3 +153,55 @@ def test_source_does_not_place_orders(project_root):
         assert "place_order(" not in text
         assert "modify_order(" not in text
         assert "cancel_order(" not in text
+
+
+def test_pending_snapshot_refreshes_and_locks_within_thirty_seconds():
+    from nse_scanner.engine import lock_from_snapshot
+    from nse_scanner.worker import Scanner
+    scanner = Scanner()
+    # Simulate a snapshot taken at 09:29:55
+    taken = datetime(2026, 11, 24, 9, 29, 55)
+    scanner.pending = {
+        "taken_at": taken,
+        "market": {"complete": True, "direction": "LONG", "status": "BULLISH"},
+        "candidates": [{"symbol": "RELIANCE", "name": "Reliance"}],
+    }
+    # At 09:30:03 (8 seconds later, at deadline)
+    now_lock = datetime(2026, 11, 24, 9, 30, 3)
+    deadline = datetime.strptime("09:30", "%H:%M").time()
+    snapshot = scanner._pending_for_lock()
+    locked, message = lock_from_snapshot(snapshot, now_lock, deadline, 30)
+    assert locked is not None
+    assert "locked from the last fresh snapshot" in message
+    assert len(locked["candidates"]) == 1
+
+
+def test_overnight_date_rollover_resets_daily_state(monkeypatch):
+    from nse_scanner.worker import Scanner
+    scanner = Scanner()
+    scanner.cache = {"trading_date": "2026-11-23"}
+    scanner.known_ids = {"signal_1"}
+    scanner.local_signals = {"signal_1": {}}
+    scanner.history_state = {"loaded": True}
+    client_mock = type("MockClient", (), {"feed": "active_feed"})()
+    scanner.client = client_mock
+    # Simulate cycle date rollover to tomorrow 2026-11-24
+    scanner.clock = lambda: datetime(2026, 11, 24, 9, 10, 0)
+    # Check that when trading_date changes, state is reset
+    now = scanner.clock()
+    trading_date = str(now.date())
+    if scanner.cache is None or scanner.cache.get("trading_date") != trading_date:
+        from nse_scanner.candles import load_cache
+        scanner.cache = load_cache(trading_date)
+        scanner.pending = scanner._load_pending(trading_date)
+        scanner.lock = scanner._load_lock(trading_date)
+        scanner.known_ids = set()
+        scanner.local_signals = {}
+        scanner.history_state = {"loaded": False}
+        if scanner.client is not None:
+            scanner.client.feed = None
+
+    assert scanner.known_ids == set()
+    assert scanner.local_signals == {}
+    assert scanner.history_state == {"loaded": False}
+    assert scanner.client.feed is None

@@ -645,9 +645,11 @@ def signal_document_id(trading_date: str, symbol: str, setup: str, candle_time: 
 def snapshot_is_lockable(snapshot_time: datetime, now: datetime, deadline: time = DEFAULT_SELECTION_DEADLINE,
                          max_age_seconds: float = 30) -> bool:
     """Lock only a snapshot taken at or before the deadline and still fresh."""
-    if snapshot_time.time() > deadline:
+    snap_t = snapshot_time.time().replace(microsecond=0)
+    dead_t = deadline.replace(microsecond=0)
+    if snap_t > dead_t:
         return False
-    age = (now - snapshot_time).total_seconds()
+    age = (now.replace(microsecond=0) - snapshot_time.replace(microsecond=0)).total_seconds()
     return 0 <= age <= max_age_seconds
 
 

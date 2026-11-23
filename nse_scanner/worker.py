@@ -182,6 +182,11 @@ class Scanner:
             self.cache = load_cache(trading_date)
             self.pending = self._load_pending(trading_date)
             self.lock = self._load_lock(trading_date)
+            self.known_ids = set()
+            self.local_signals = {}
+            self.history_state = {"loaded": False}
+            if self.client is not None:
+                self.client.feed = None
         open_time = parse_clock(settings["market_open"])
         close_time = parse_clock(settings["market_close"])
         deadline = parse_clock(settings["selection_deadline"])
@@ -231,18 +236,22 @@ class Scanner:
             elif self.lock is None:
                 notes.append("Developer mode is on. A test list is waiting for a complete price set.")
         else:
-            if self.lock is None and now.time() <= deadline and market.get("complete"):
+            now_time = now.time().replace(microsecond=0)
+            deadline_time = deadline.replace(microsecond=0)
+            if self.lock is None and now_time <= deadline_time and market.get("complete"):
                 age = None if not self.pending else (now - self.pending["taken_at"]).total_seconds()
-                if age is None or age >= 60:
+                if age is None or age >= 5:
                     self.pending = self._snapshot(settings, market, prices, now)
                 notes.append("A fresh pre-deadline snapshot is ready.")
-            if self.lock is None and now.time() >= deadline:
+            if self.lock is None and now_time >= deadline_time:
                 snapshot = self._pending_for_lock()
                 locked, message = lock_from_snapshot(
                     snapshot, now, deadline, quote_max_age_seconds(settings)
                 )
                 self._store_lock(locked, message, trading_date, now)
                 notes.append(message)
+                if locked is not None:
+                    self._refresh_candles(now, settings)
         if self.lock and self.lock.get("direction"):
             allowed, message = reversal_allows_signals(
                 self.lock.get("direction"), market, effective_reversal_protection(settings)
@@ -629,7 +638,7 @@ class Scanner:
         )
         if member_notes:
             notes["sector_mapping"] = " ".join(member_notes)
-        snapshot = {"taken_at": now, "market": market, "candidates": candidates, "considered": rows, "notes": notes}
+        snapshot = {"taken_at": now.replace(microsecond=0), "market": market, "candidates": candidates, "considered": rows, "notes": notes}
         write_json("pending_snapshot.json", {
             "trading_date": str(now.date()),
             "taken_at": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -719,10 +728,14 @@ class Scanner:
 
     def _pending_for_lock(self) -> dict | None:
         if not self.pending:
+            self.pending = self._load_pending(str(self.clock().date()))
+        if not self.pending:
             return None
         pending = dict(self.pending)
         if isinstance(pending.get("taken_at"), str):
             pending["taken_at"] = datetime.strptime(pending["taken_at"], "%Y-%m-%d %H:%M:%S")
+        if isinstance(pending.get("taken_at"), datetime):
+            pending["taken_at"] = pending["taken_at"].replace(microsecond=0)
         return pending
 
     def _store_lock(self, snapshot, message, trading_date, now) -> None:

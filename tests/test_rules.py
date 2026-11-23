@@ -291,6 +291,11 @@ def test_signal_identity_and_selection_lock():
     assert snapshot_is_lockable(fresh["taken_at"], datetime(2026, 11, 20, 9, 30, 10), time(9, 30), 30)
     assert not snapshot_is_lockable(datetime(2026, 11, 20, 9, 30, 1), datetime(2026, 11, 20, 9, 30, 1), time(9, 30), 30)
     assert not snapshot_is_lockable(datetime(2026, 11, 20, 9, 28), datetime(2026, 11, 20, 9, 30), time(9, 30), 30)
+    # Test boundary with microseconds at 09:30:00
+    assert snapshot_is_lockable(datetime(2026, 11, 20, 9, 30, 0, 125000), datetime(2026, 11, 20, 9, 30, 5), time(9, 30), 30)
+    # Test 30-second freshness window
+    assert snapshot_is_lockable(datetime(2026, 11, 20, 9, 29, 35), datetime(2026, 11, 20, 9, 30, 4), time(9, 30), 30)
+    assert not snapshot_is_lockable(datetime(2026, 11, 20, 9, 29, 25), datetime(2026, 11, 20, 9, 30, 5), time(9, 30), 30)
 
 
 def test_missing_candle_slots_are_reported():
