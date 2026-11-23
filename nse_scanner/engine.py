@@ -23,9 +23,11 @@ from scanner_rules import (
 )
 
 
-def parse_clock(value: str) -> time:
-    hour, minute = value.split(":")
-    return time(int(hour), int(minute))
+def parse_clock(value: str | time) -> time:
+    if isinstance(value, time):
+        return value
+    parts = str(value).split(":")
+    return time(int(parts[0]), int(parts[1]))
 
 
 def quotes_from_prices(symbols: list[dict], prices: dict, previous: dict, now: datetime) -> dict:
