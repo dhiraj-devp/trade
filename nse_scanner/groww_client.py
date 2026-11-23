@@ -349,6 +349,7 @@ class GrowwClient:
             return False, "More than 1000 instruments were requested. The live feed was not partially subscribed."
         try:
             from growwapi import GrowwFeed
+            _redirect_groww_feed_files()
             self.feed = GrowwFeed(self.api)
             subscription = [
                 {"exchange": "NSE", "segment": "CASH", "exchange_token": str(item["exchange_token"])}
@@ -379,6 +380,45 @@ class GrowwClient:
     def reconnect_feed(self, instruments: list[dict]) -> tuple[bool, str]:
         self.feed = None
         return self.start_feed(instruments)
+
+
+def _redirect_groww_feed_files() -> None:
+    """Store the feed credential files outside the Groww package.
+
+    The SDK writes a.creds and b.creds beside its own source. Streamlit Cloud
+    cannot write inside site-packages, so those files go in the app home.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from growwapi.common import files as file_utils
+
+    from nse_scanner.paths import secrets_dir
+
+    def folder() -> Path:
+        try:
+            path = secrets_dir() / "groww_feed"
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return path
+        except OSError:
+            path = Path(tempfile.gettempdir()) / "nse_fno_groww_feed"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    def write(name: str, content: str) -> str:
+        path = folder() / name
+        path.write_text(content, encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return str(path)
+
+    file_utils.generate_token_file = lambda jwt_token: write("a.creds", str(jwt_token))
+    file_utils.generate_seed_file = lambda seed: write("b.creds", str(seed))
 
 
 def classify_probe_failure(message: str) -> str:

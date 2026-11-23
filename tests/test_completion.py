@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from nse_scanner.decisions import build_board, coverage_is_complete, strategy_coverage
 from nse_scanner.constituents import (
@@ -259,6 +260,24 @@ def test_permission_probe_does_not_treat_forbidden_data_as_a_failed_login():
     failed = client.probe_permissions()
     assert failed[0]["ok"] is False
     assert all(row["category"] == "not_tested" for row in failed[1:])
+
+
+def test_feed_credentials_are_not_written_inside_the_groww_package(tmp_path, monkeypatch):
+    from growwapi.common import files as file_utils
+
+    from nse_scanner.groww_client import _redirect_groww_feed_files
+    from nse_scanner import paths
+
+    monkeypatch.setattr(paths, "app_home", lambda: tmp_path)
+    _redirect_groww_feed_files()
+    token_path = file_utils.generate_token_file("feed-token")
+    seed_path = file_utils.generate_seed_file("feed-seed")
+    assert Path(token_path).read_text(encoding="utf-8") == "feed-token"
+    assert Path(seed_path).read_text(encoding="utf-8") == "feed-seed"
+    assert "site-packages" not in token_path.replace("\\", "/")
+    assert "site-packages" not in seed_path.replace("\\", "/")
+    assert token_path.startswith(str(tmp_path))
+    assert seed_path.startswith(str(tmp_path))
 
 
 def test_instrument_master_is_loaded_without_writing_the_package_directory(monkeypatch):
