@@ -20,6 +20,7 @@ from nse_scanner.candles import (
     store_previous_day,
 )
 from nse_scanner.control import clear_worker_record, stop_requested, write_worker_record
+from nse_scanner.decisions import build_board
 from nse_scanner.constituents import apply_cash_validation, describe_lists, refresh_official_lists
 from nse_scanner.engine import (
     choose_candidates,
@@ -30,13 +31,33 @@ from nse_scanner.engine import (
     reversal_allows_signals,
     signals_for_candidate,
 )
-from nse_scanner.groww_client import GrowwClient
+from nse_scanner.groww_client import GrowwClient, classify_probe_failure
 from nse_scanner.logging_setup import setup_logging
 from nse_scanner.notify import notify_all
 from nse_scanner.paths import lists_dir
-from nse_scanner.readiness import readiness
+from nse_scanner.cloud_budget import (
+    FAILED,
+    LOCAL_ONLY,
+    PENDING,
+    SAVED,
+    cached_history_rows,
+    deliver_cloud_event,
+    file_sha256,
+    firebase_configured,
+    flush_queue,
+    load_budget,
+    load_signal_ids_once,
+    pending_count,
+    persist_breadth,
+    remember_history,
+    remember_report,
+    sha256_text,
+    store_new_signal,
+    sync_instrument_metadata,
+)
+from nse_scanner.readiness import readiness, scan_is_blocked
 from nse_scanner.redact import public_text
-from nse_scanner.settings import load_settings, public_settings
+from nse_scanner.settings import load_settings, public_settings, quote_max_age_seconds, session_limits_apply
 from nse_scanner.state import read_json, write_json, write_status
 from nse_scanner.store import FirestoreStore
 from nse_scanner.universe import (
@@ -66,9 +87,19 @@ class Scanner:
         self.index_matches = {}
         self.sector_block = "Sector indexes have not been checked against the Groww instrument file yet."
         self.known_ids = set()
+        self.local_signals = {}
+        self.active_developer_mode = False
         self.pending = None
         self.lock = None
         self.errors = []
+        self.budget = load_budget()
+        self.history_state = {"loaded": False}
+        self.cloud_checked = False
+        if self.store is not None and getattr(self.store, "budget", None) is None:
+            try:
+                self.store.budget = self.budget
+            except Exception:
+                pass
         self.feed_status = "not started"
         self.last_report_date = read_json("report_date.json", {}).get("trading_date")
 
@@ -89,14 +120,61 @@ class Scanner:
             clear_worker_record()
             self.logger.info("Scanner process stopped.")
 
+    def _apply_data_mode(self, settings) -> None:
+        developer = bool(settings.get("developer_mode"))
+        if getattr(self, "active_developer_mode", None) == developer:
+            if self.store is not None:
+                self.store.developer_mode = developer
+            return
+        self.active_developer_mode = developer
+        self.cache = None
+        self.pending = None
+        self.lock = None
+        self.known_ids = set()
+        self.local_signals = {}
+        self.errors = []
+        self.history_state = {"loaded": False}
+        self.last_report_date = read_json("report_date.json", {}).get("trading_date")
+        if self.store is not None:
+            self.store.developer_mode = developer
+
+    def _remember_signal(self, signal: dict) -> None:
+        stored = getattr(self, "local_signals", None)
+        if stored is None:
+            stored = {}
+            self.local_signals = stored
+        if signal.get("id"):
+            stored[signal["id"]] = signal
+
+    def _signals_for_board(self, now) -> list:
+        merged = {}
+        for row in cached_history_rows():
+            if row.get("trading_date") == str(now.date()) and row.get("id"):
+                merged[row["id"]] = row
+        merged.update(getattr(self, "local_signals", {}) or {})
+        return list(merged.values())
+
+    def _note_error(self, message: str) -> None:
+        if not message:
+            return
+        try:
+            self.logger.warning("%s", message)
+        except Exception:
+            pass
+        if message not in self.errors:
+            self.errors.append(message)
+            self.errors = self.errors[-20:]
+
     def cycle(self) -> None:
         now = self.clock()
         settings = load_settings()
+        self._apply_data_mode(settings)
         trading_date = str(now.date())
-        if now.weekday() >= 5:
+        limited = session_limits_apply(settings)
+        if limited and now.weekday() >= 5:
             self.publish("closed", "Weekend. The NSE cash session is closed.", settings, now)
             return
-        holiday = self._holiday(trading_date)
+        holiday = self._holiday(trading_date) if limited else ""
         if holiday:
             self.publish("closed", f"Exchange holiday ({holiday}). The live scan is not running.", settings, now)
             return
@@ -109,38 +187,62 @@ class Scanner:
         deadline = parse_clock(settings["selection_deadline"])
         if not self._connect(settings):
             return
+        try:
+            flush_queue(self.store, self.budget, now)
+        except Exception:
+            self.logger.exception("Cloud queue flush failed")
+        try:
+            self._maybe_health(now)
+            self._sync_public_config(now)
+        except Exception:
+            self.logger.exception("Cloud housekeeping failed")
         if not self._load_market_lists(settings, now):
             return
         self._load_known_signals(trading_date)
-        if now.time() < open_time:
+        if limited and now.time() < open_time:
             self.publish("waiting", "Before the market open. Previous-day candles are loading.", settings, now)
             self._fill_previous_closes(now)
             self.publish("waiting", "Before the market open. Previous-day candles are loading.", settings, now)
             return
-        if now.time() >= close_time:
+        if limited and now.time() >= close_time:
             self._report(now, settings)
             self.publish("closed", "Market closed for the day.", settings, now)
             return
         self._fill_previous_closes(now)
         self._refresh_feed()
-        prices, price_error = self._prices(now)
+        prices, price_error = self._prices(now, quote_max_age_seconds(settings))
         if price_error:
             self.errors.append(price_error)
-        self._refresh_candles(now, settings)
+        if self.lock is not None:
+            self._refresh_candles(now, settings)
         market = self._breadth(settings, prices, now)
         notes = []
-        if self.lock is None and now.time() <= deadline and market.get("complete"):
-            age = None if not self.pending else (now - self.pending["taken_at"]).total_seconds()
-            if age is None or age >= 60:
+        if not limited:
+            if self.lock is None and market.get("complete"):
                 self.pending = self._snapshot(settings, market, prices, now)
-            notes.append("A fresh pre-deadline snapshot is ready.")
-        if self.lock is None and now.time() >= deadline:
-            snapshot = self._pending_for_lock()
-            locked, message = lock_from_snapshot(
-                snapshot, now, deadline, float(settings.get("quote_max_age_seconds") or 30)
-            )
-            self._store_lock(locked, message, trading_date, now)
-            notes.append(message)
+                self._store_lock(
+                    self.pending,
+                    "Developer mode test list. Built from the current data for testing. It is not the production 9:30 list.",
+                    trading_date,
+                    now,
+                )
+                notes.append(self.lock.get("reason") or "")
+                self._refresh_candles(now, settings)
+            elif self.lock is None:
+                notes.append("Developer mode is on. A test list is waiting for a complete price set.")
+        else:
+            if self.lock is None and now.time() <= deadline and market.get("complete"):
+                age = None if not self.pending else (now - self.pending["taken_at"]).total_seconds()
+                if age is None or age >= 60:
+                    self.pending = self._snapshot(settings, market, prices, now)
+                notes.append("A fresh pre-deadline snapshot is ready.")
+            if self.lock is None and now.time() >= deadline:
+                snapshot = self._pending_for_lock()
+                locked, message = lock_from_snapshot(
+                    snapshot, now, deadline, quote_max_age_seconds(settings)
+                )
+                self._store_lock(locked, message, trading_date, now)
+                notes.append(message)
         if self.lock and self.lock.get("direction"):
             allowed, message = reversal_allows_signals(
                 self.lock.get("direction"), market, effective_reversal_protection(settings)
@@ -148,38 +250,136 @@ class Scanner:
             notes.append(message)
             if allowed:
                 notes.extend(self._emit(now, settings))
+        if self.budget.state != "open" or pending_count():
+            notes.append(self.budget.status_line(now))
         self.publish("running", " ".join(notes) or "Scanner is running.", settings, now, market=market, prices=prices)
 
     def _connect(self, settings) -> bool:
         report = readiness(settings, universe_hash=settings.get("fno_universe_hash") or "pending",
                            nifty_symbols=["pending"] if settings.get("nifty50_approved") else [],
                            sector_file_ok=(lists_dir() / "sectors.csv").exists())
-        # Connection itself is checked here; universe approval is checked after the master loads.
-        if not report["checks"][0]["passed"] or not report["checks"][2]["passed"]:
-            self.publish("not_ready", "Groww and Firebase credentials are required before live scanning.", settings, self.clock())
+        if not report["checks"][0]["passed"]:
+            self.publish("not_ready", "Groww credentials are required before live scanning.", settings, self.clock())
             return False
         if self.client is None:
             self.client = GrowwClient(settings, sleep=self.sleep)
         if self.client.api is None:
+            hold = getattr(self, "auth_hold_until", None)
+            if hold and self.clock() < hold:
+                self.publish("not_ready", self.auth_hold_message, settings, self.clock())
+                return False
             ok, message = self.client.authenticate()
             if not ok:
+                if classify_probe_failure(message) == "permission_denied":
+                    self.auth_hold_until = self.clock() + timedelta(minutes=15)
+                    message += " This permission failure will not be retried for 15 minutes."
+                    self.auth_hold_message = message
                 self.publish("not_ready", message, settings, self.clock())
                 return False
-        if self.store is None:
-            try:
-                self.store = FirestoreStore.connect()
-                self.store.save_public_config(public_settings())
-            except Exception as exc:
-                self.publish("not_ready", public_text(str(exc)), settings, self.clock())
-                return False
-        last_ping = getattr(self, "last_ping", None)
-        if last_ping is None or (self.clock() - last_ping).total_seconds() >= 60:
-            ok, message = self.store.ping()
-            self.last_ping = self.clock()
-            if not ok:
-                self.publish("not_ready", message, settings, self.clock())
-                return False
+        self._ensure_store(settings)
         return True
+
+    def _ensure_store(self, settings) -> None:
+        now = self.clock()
+        if self.store is not None:
+            if getattr(self.store, "budget", None) is None or self.store.budget is not self.budget:
+                try:
+                    self.store.budget = self.budget
+                except Exception:
+                    pass
+            if hasattr(self.store, "developer_mode"):
+                self.store.developer_mode = bool(settings.get("developer_mode"))
+            if not hasattr(self.store, "check_connection"):
+                self.cloud_checked = True
+                return
+            if not self.cloud_checked:
+                self.cloud_checked = True
+                self._startup_cloud_check(now)
+            return
+        if not firebase_configured():
+            return
+        if self.cloud_checked and not self.budget.allow(now)[0]:
+            return
+        try:
+            self.store = FirestoreStore.connect(budget=self.budget)
+            self.store.developer_mode = bool(settings.get("developer_mode"))
+        except Exception as exc:
+            self.cloud_checked = True
+            self.budget.observe_failure(public_text(str(exc)), now)
+            self._note_error(public_text(str(exc)))
+            return
+        self.cloud_checked = True
+        self._startup_cloud_check(now)
+
+    def _startup_cloud_check(self, now) -> None:
+        if self.store is None:
+            return
+        try:
+            ok, message = self.store.check_connection()
+        except Exception as exc:
+            self._note_error(public_text(str(exc)))
+            return
+        if not ok:
+            self._note_error(message)
+            return
+        self._record_recovery(now)
+
+    def _maybe_health(self, now) -> None:
+        if self.store is None or not self.budget.health_due(now):
+            return
+        if not self.budget.allow(now, essential=False)[0]:
+            return
+        try:
+            ok, message = self.store.save_health("worker", {
+                "ok": True,
+                "checked_at": now.isoformat(sep=" ", timespec="seconds"),
+            })
+        except Exception as exc:
+            self._note_error(public_text(str(exc)))
+            return
+        if ok:
+            self.budget.mark_health(now)
+            return
+        self._note_error(message)
+
+    def _sync_public_config(self, now) -> None:
+        if self.store is None:
+            return
+        import json
+        payload = public_settings()
+        digest = sha256_text(json.dumps(payload, sort_keys=True, default=str))
+        if digest == self.budget.public_config_checksum:
+            return
+        if not self.budget.allow(now, essential=False)[0]:
+            return
+        try:
+            ok, message = self.store.save_public_config(payload)
+        except Exception as exc:
+            self._note_error(public_text(str(exc)))
+            return
+        if ok:
+            self.budget.public_config_checksum = digest
+            self.budget.save()
+            return
+        self._note_error(message)
+
+    def _record_recovery(self, now) -> None:
+        if not self.budget.consume_recovery():
+            return
+        self.logger.info("Firestore connection recovered.")
+        if not self.budget.should_persist_error("recovery", "Firestore connection recovered"):
+            return
+        if self.store is None or not self.budget.allow(now, essential=False)[0]:
+            return
+        try:
+            self.store.add_log({
+                "at": now.isoformat(sep=" ", timespec="seconds"),
+                "category": "recovery",
+                "message": "Firestore connection recovered",
+                "state": "recovered",
+            })
+        except Exception:
+            return
 
     def _load_market_lists(self, settings, now) -> bool:
         try:
@@ -213,10 +413,23 @@ class Scanner:
             settings, universe_hash, nifty_symbols, bool(self.sector_map),
             nifty_meta=nifty_meta, sector_status=sector_status,
         )
-        if not report["ready"]:
+        if scan_is_blocked(report):
             self.publish("not_ready", "Live scanning is blocked until every mandatory check passes.", settings, now, readiness_report=report)
             return False
-        self.store.upsert_instruments(self.nifty + self.universe + self.indexes)
+        try:
+            from nse_scanner.paths import runtime_dir
+            instrument_file = runtime_dir() / "instruments.csv"
+            if instrument_file.exists():
+                sync_instrument_metadata(
+                    self.store,
+                    self.budget,
+                    file_sha256(instrument_file),
+                    len(frame),
+                    "Groww instrument master file",
+                    now,
+                )
+        except Exception as exc:
+            self._note_error(public_text(str(exc)))
         return True
 
     def _instrument_frame(self) -> pd.DataFrame:
@@ -286,11 +499,16 @@ class Scanner:
                 continue
             if stop_requested() or fetched >= limit:
                 break
-            attempts[symbol] = now.strftime("%Y-%m-%d %H:%M:%S")
             try:
                 payload = self.client.historical_candles(item["groww_symbol"], start, end, interval)
-                store_previous_day(self.cache, symbol, parse_groww_candles(payload), str(now.date()))
+                stored = store_previous_day(self.cache, symbol, parse_groww_candles(payload), str(now.date()))
+                if not stored:
+                    attempts[symbol] = now.strftime("%Y-%m-%d %H:%M:%S")
+                    note = f"{symbol} previous day: no candle before {now.date()} was returned."
+                    if note not in self.errors:
+                        self.errors.append(note)
             except Exception as exc:
+                attempts[symbol] = now.strftime("%Y-%m-%d %H:%M:%S")
                 self.errors.append(f"{symbol} previous day: {public_text(str(exc))}")
             fetched += 1
         save_cache(self.cache)
@@ -306,7 +524,7 @@ class Scanner:
         ok, message = self.client.start_feed(instruments)
         self.feed_status = "subscribed" if ok else f"REST fallback: {message}"
 
-    def _prices(self, now) -> tuple[dict, str]:
+    def _prices(self, now, max_age: float = 30) -> tuple[dict, str]:
         token_to_symbol = {
             str(item.get("exchange_token")): item["symbol"]
             for item in self._monitored() if item.get("exchange_token")
@@ -319,6 +537,8 @@ class Scanner:
             if not symbol or not isinstance(row, dict) or row.get("ltp") is None or row.get("tsInMillis") is None:
                 continue
             as_of = datetime.fromtimestamp(float(row["tsInMillis"]) / 1000, IST).replace(tzinfo=None)
+            if (now - as_of).total_seconds() > max_age:
+                continue
             prices[symbol] = (float(row["ltp"]), as_of)
         missing = [f"NSE_{item['symbol']}" for item in self._monitored() if item["symbol"] not in prices]
         if not missing:
@@ -341,12 +561,16 @@ class Scanner:
         ]
         fetched = self.cache.setdefault("fetched_at", {})
         for item in targets:
-            complete, _missing = history_is_complete(
-                self.cache, item["symbol"], now.date(), now,
-                open_time=parse_clock(settings["market_open"]),
-                close_time=parse_clock(settings["market_close"]),
-                interval_minutes=int(settings["candle_minutes"]),
-            )
+            try:
+                complete, _missing = history_is_complete(
+                    self.cache, item["symbol"], now.date(), now,
+                    open_time=parse_clock(settings["market_open"]),
+                    close_time=parse_clock(settings["market_close"]),
+                    interval_minutes=int(settings["candle_minutes"]),
+                )
+            except Exception as exc:
+                self.errors.append(f"{item['symbol']} candles: {public_text(str(exc))}")
+                continue
             if complete:
                 continue
             last = fetched.get(item["symbol"])
@@ -362,7 +586,7 @@ class Scanner:
         save_cache(self.cache)
 
     def _breadth(self, settings, prices, now) -> dict:
-        max_age = float(settings.get("quote_max_age_seconds") or 30)
+        max_age = quote_max_age_seconds(settings)
         thresholds = {
             "advance_min": float(settings["advance_min"]),
             "decline_max": float(settings["decline_max"]),
@@ -374,24 +598,21 @@ class Scanner:
                                  [item["symbol"] for item in self.universe], now, max_age)
         market = market_from_groups(nifty, fno, **thresholds)
         market["taken_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
-        last_write = getattr(self, "last_breadth_write", None)
-        if market.get("complete") and (last_write is None or (now - last_write).total_seconds() >= 60):
-            self.last_breadth_write = now
-            self.store.save_breadth({
-                "trading_date": str(now.date()),
-                "status": market["status"],
-                "direction": market["direction"],
-                "reason": market["reason"],
-                "nifty50": market["nifty50"],
-                "fno": market["fno"],
-                "taken_at": market["taken_at"],
-                "origin": "live",
-            })
+        try:
+            persist_breadth(
+                self.store,
+                self.budget,
+                market,
+                now,
+                "developer" if settings.get("developer_mode") else "live",
+            )
+        except Exception as exc:
+            self._note_error(public_text(str(exc)))
         return market
 
     def _snapshot(self, settings, market, prices, now) -> dict:
         from nse_scanner.engine import priced_rows
-        max_age = float(settings.get("quote_max_age_seconds") or 30)
+        max_age = quote_max_age_seconds(settings)
         fno_group = assess_quote_group(
             quotes_from_prices(self.universe, prices, self.cache["previous"], now),
             [item["symbol"] for item in self.universe], now, max_age,
@@ -447,7 +668,7 @@ class Scanner:
             ]
         moves = []
         previous = self.cache.get("previous") or {}
-        max_age = float(settings.get("quote_max_age_seconds") or 30)
+        max_age = quote_max_age_seconds(settings)
         for item in self.indexes:
             price = prices.get(item["symbol"])
             prior = previous.get(item["symbol"])
@@ -525,7 +746,22 @@ class Scanner:
             "reason": message,
         }
         write_json("selection_lock.json", self.lock)
-        self.store.save_candidates({**self.lock, "origin": "live"})
+        origin = "developer" if self.active_developer_mode else "live"
+        cloud_doc = {
+            "trading_date": trading_date,
+            "locked": True,
+            "locked_at": self.lock["locked_at"],
+            "direction": direction,
+            "reason": message,
+            "symbols": [item.get("symbol") for item in candidates if item.get("symbol")],
+            "origin": origin,
+        }
+        try:
+            deliver_cloud_event(
+                self.store, self.budget, "candidates", f"candidates:{trading_date}", cloud_doc, now, firebase_configured(),
+            )
+        except Exception as exc:
+            self._note_error(public_text(str(exc)))
         self.logger.info(message)
 
     def _emit(self, now, settings) -> list[str]:
@@ -538,28 +774,51 @@ class Scanner:
             if note:
                 notes.append(note)
             for signal in signals:
-                ok, message = self.store.save_signal(signal["id"], signal)
-                if not ok:
-                    self.errors.append(message)
-                    return notes + ["Signal storage failed, so no further signal was emitted."]
-                self.known_ids.add(signal["id"])
+                if self.active_developer_mode:
+                    signal = {**signal, "origin": "developer"}
+                try:
+                    sync_state = store_new_signal(
+                        self.store, self.budget, self.known_ids, signal, now, firebase_configured(),
+                    )
+                except Exception as exc:
+                    self._note_error(public_text(str(exc)))
+                    sync_state = LOCAL_ONLY
+                if sync_state == "duplicate":
+                    continue
+                signal = {**signal, "sync_state": sync_state}
+                self._remember_signal(signal)
                 text = (
                     f"{signal['symbol']} {signal['direction']} {signal['setup']} "
-                    f"at {signal['candle_time']}. Close {signal['close']}. Sources: {', '.join(signal['sources'])}."
+                    f"at {signal['candle_time']}. Close {signal['close']}. Sources: {', '.join(signal['sources'])}. "
+                    f"Cloud: {sync_state}."
                 )
-                notes.extend(notify_all(settings, text))
-                self.logger.info("Live signal stored: %s", text)
+                if sync_state == SAVED:
+                    notes.append(f"{signal['symbol']} {signal['setup']} was saved in Firebase.")
+                elif sync_state == PENDING:
+                    notes.append(f"{signal['symbol']} {signal['setup']} is pending local sync.")
+                elif sync_state == FAILED:
+                    notes.append(f"{signal['symbol']} {signal['setup']} could not be synced. It remains local.")
+                else:
+                    notes.append(f"{signal['symbol']} {signal['setup']} is stored on this computer only.")
+                if settings.get("developer_mode"):
+                    self.logger.info("Developer mode signal recorded separately: %s", text)
+                else:
+                    notes.extend(notify_all(settings, text))
+                    self.logger.info("Live signal recorded: %s", text)
         return notes
 
     def _report(self, now, settings) -> None:
         trading_date = str(now.date())
         if self.last_report_date == trading_date:
             return
-        ok, signals = self.store.query_signals(trading_date, 500, None) if self.store else (False, [])
-        live_signals = [row for row in signals if isinstance(row, dict) and row.get("origin") == "live"] if ok else []
+        origin = "developer" if self.active_developer_mode else "live"
+        live_signals = [
+            row for row in cached_history_rows()
+            if isinstance(row, dict) and row.get("trading_date") == trading_date and row.get("origin") == origin
+        ]
         report = {
             "trading_date": trading_date,
-            "origin": "live",
+            "origin": origin,
             "market_status": None if not self.lock else (self.lock.get("market") or {}).get("status"),
             "candidate_count": len((self.lock or {}).get("candidates") or []),
             "signal_count": len(live_signals),
@@ -567,18 +826,20 @@ class Scanner:
             "errors": self.errors[-20:],
             "note": "Signals only. This report does not place orders and does not calculate profit.",
         }
-        if self.store:
-            self.store.save_report(report)
+        try:
+            remember_report(report)
+            deliver_cloud_event(self.store, self.budget, "report", f"report:{trading_date}", report, now, firebase_configured())
+        except Exception as exc:
+            self._note_error(public_text(str(exc)))
         write_json("report_date.json", {"trading_date": trading_date})
         self.last_report_date = trading_date
         del settings
 
     def _load_known_signals(self, trading_date: str) -> None:
-        if not self.store:
-            return
-        ok, rows = self.store.query_signals(trading_date, 500, None)
-        if ok:
-            self.known_ids.update(row.get("id") for row in rows if isinstance(row, dict) and row.get("id"))
+        try:
+            load_signal_ids_once(self.store, self.known_ids, self.history_state, trading_date, self.clock(), self.budget)
+        except Exception as exc:
+            self._note_error(public_text(str(exc)))
 
     def _monitored(self) -> list[dict]:
         seen = set()
@@ -619,8 +880,12 @@ class Scanner:
         elif row.get("current_price") is not None:
             enriched["ltp"] = row["current_price"]
         if completed:
-            enriched["day_high"] = max(item["high"] for item in completed)
-            enriched["day_low"] = min(item["low"] for item in completed)
+            highs = [item["high"] for item in completed if item.get("high") is not None]
+            lows = [item["low"] for item in completed if item.get("low") is not None]
+            if highs:
+                enriched["day_high"] = max(highs)
+            if lows:
+                enriched["day_low"] = min(lows)
             enriched["volume"] = sum(item["volume"] for item in completed if item.get("volume") is not None)
         if previous:
             enriched["previous_day_high"] = previous.get("high")
@@ -632,7 +897,23 @@ class Scanner:
     def _board(self, now, market, priced_candidates, signals) -> dict:
         lock = self.lock or {}
         locked = bool(lock.get("locked"))
-        decision_market = lock.get("market") or market or {}
+        if locked and not lock.get("direction"):
+            decision_market = {
+                "complete": False,
+                "status": "BLOCKED",
+                "direction": None,
+                "reason": lock.get("reason") or "No candidate list was locked from a fresh snapshot at or before 9:30.",
+            }
+        elif self.active_developer_mode and not locked:
+            decision_market = {
+                "complete": False,
+                "status": "BLOCKED",
+                "direction": None,
+                "reason": (market or {}).get("reason") or "Developer mode is waiting for a complete price set.",
+            }
+            locked = True
+        else:
+            decision_market = lock.get("market") or market or {}
         selected = [self._enrich(row, now) for row in priced_candidates] if locked else []
         selected_symbols = {row.get("symbol") for row in selected}
         considered = [
@@ -673,7 +954,7 @@ class Scanner:
         now = now or self.clock()
         settings = settings or load_settings()
         prices = prices or {}
-        max_age = float(settings.get("quote_max_age_seconds") or 30)
+        max_age = quote_max_age_seconds(settings)
         candidates = []
         for row in (self.lock or {}).get("candidates") or []:
             price = prices.get(row["symbol"])
@@ -683,22 +964,21 @@ class Scanner:
                 "current_price": price[0] if fresh else None,
                 "current_price_status": "live" if fresh else "unavailable",
             })
-        ok, signals = self.store.query_signals(str(now.date()), 200, None) if self.store else (False, [])
         live_signals = []
-        if ok:
-            for signal in signals:
-                if not isinstance(signal, dict) or signal.get("origin") != "live":
-                    continue
-                price = prices.get(signal.get("symbol"))
-                fresh = bool(price and (now - price[1]).total_seconds() <= max_age)
-                live_signals.append({
-                    **signal,
-                    "current_price": price[0] if fresh else None,
-                    "current_price_status": "live" if fresh else "unavailable",
-                })
+        for signal in self._signals_for_board(now):
+            if not isinstance(signal, dict) or signal.get("origin") not in ("live", "developer"):
+                continue
+            price = prices.get(signal.get("symbol"))
+            fresh = bool(price and (now - price[1]).total_seconds() <= max_age)
+            live_signals.append({
+                **signal,
+                "current_price": price[0] if fresh else None,
+                "current_price_status": "live" if fresh else "unavailable",
+            })
         previous_ready = len([item for item in self._monitored() if item["symbol"] in (self.cache or {}).get("previous", {})]) if self.cache else 0
         write_status({
             "scanner_state": state,
+            "developer_mode": bool(settings.get("developer_mode")),
             "message": message,
             "trading_date": str(now.date()),
             "readiness": readiness_report,
@@ -728,11 +1008,40 @@ class Scanner:
                 "last_groww_success": getattr(self.client, "last_success", None),
                 "last_error": self.errors[-1] if self.errors else "",
                 "errors": self.errors[-10:],
-                "database": "connected" if self.store else "not connected",
+                "database": self._database_label(),
+                "firestore": self.budget.public_view(now),
             },
         })
-        if self.store and self.errors:
-            self.store.add_log({"at": now.isoformat(sep=" ", timespec="seconds"), "message": self.errors[-1], "state": state})
+        self._log_new_error(now, state)
+
+    def _database_label(self) -> str:
+        if self.budget.state == "quota":
+            return "paused until the daily quota resets"
+        if self.budget.state == "permission":
+            return "permission denied"
+        if self.budget.state == "backoff":
+            return "retry scheduled"
+        if self.store is None:
+            return "local only" if not firebase_configured() else "not connected"
+        return "connected"
+
+    def _log_new_error(self, now, state: str) -> None:
+        if not self.errors:
+            return
+        message = self.errors[-1]
+        try:
+            if not self.budget.should_persist_error("scanner", message):
+                return
+            if self.store is None or not self.budget.allow(now, essential=False)[0]:
+                return
+            self.store.add_log({
+                "at": now.isoformat(sep=" ", timespec="seconds"),
+                "category": "scanner",
+                "message": message,
+                "state": state,
+            })
+        except Exception:
+            return
 
 
 def main() -> None:

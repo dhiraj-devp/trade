@@ -39,5 +39,17 @@ def runtime_dir() -> Path:
     return path
 
 
+def data_dir() -> Path:
+    """Scan results. Developer mode uses its own folder and never writes the production files."""
+    from nse_scanner.settings import developer_mode_enabled
+
+    root = runtime_dir()
+    if not developer_mode_enabled():
+        return root
+    path = root / "developer"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def templates_dir() -> Path:
     return project_root() / "templates"

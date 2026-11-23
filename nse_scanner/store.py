@@ -29,8 +29,25 @@ class Store(Protocol):
     def recent_logs(self, limit: int) -> tuple[bool, list]: ...
 
 
+_FAST_IO = {"retry": None, "timeout": 8.0}
+
+
+def cloud_is_limited(message: str) -> bool:
+    """True only for a confirmed daily quota failure, not every HTTP 429."""
+    from nse_scanner.cloud_budget import classify_firestore_failure
+    return classify_firestore_failure(message) == "quota"
+
+
+def scoped_collection(name: str, developer_mode: bool) -> str:
+    """Developer records use a dev_ prefix. Production collection names stay unchanged."""
+    if developer_mode and not name.startswith("dev_"):
+        return f"dev_{name}"
+    return name
+
+
 class MemoryStore:
     def __init__(self):
+        self.developer_mode = False
         self.instruments = {}
         self.sectors = {}
         self.breadth = {}
@@ -127,11 +144,15 @@ class MemoryStore:
 
 
 class FirestoreStore:
-    def __init__(self, client):
+    def __init__(self, client, developer_mode: bool = False, budget=None):
+        from nse_scanner.cloud_budget import load_budget
+
         self.client = client
+        self.developer_mode = bool(developer_mode)
+        self.budget = budget or load_budget()
 
     @classmethod
-    def connect(cls):
+    def connect(cls, budget=None):
         import firebase_admin
         from firebase_admin import credentials, firestore
 
@@ -144,22 +165,33 @@ class FirestoreStore:
             app = firebase_admin.get_app("nse_fno_scanner")
         except ValueError:
             app = firebase_admin.initialize_app(credentials.Certificate(certificate), name="nse_fno_scanner")
-        return cls(firestore.client(app))
+        from nse_scanner.settings import developer_mode_enabled
+
+        return cls(firestore.client(app), developer_mode_enabled(), budget=budget)
 
     def _collection(self, name: str):
-        return self.client.collection(name)
+        return self.client.collection(scoped_collection(name, self.developer_mode))
 
     def ping(self) -> tuple[bool, str]:
+        """One read of the existing health document. No write and no delete."""
+        return self.check_connection()
+
+    def check_connection(self) -> tuple[bool, str]:
+        allowed, message = self.budget.allow(datetime.now(), essential=True)
+        if not allowed:
+            return False, message
         try:
-            document = self._collection("api_health").document("connection_test")
-            document.set({"ok": True, "tested_at": datetime.utcnow().isoformat()})
-            loaded = document.get()
-            if not loaded.exists:
-                return False, "Firestore write could not be read back."
-            document.delete()
-            return True, "Firestore read and write test succeeded."
+            loaded = self._collection("api_health").document("worker").get(**_FAST_IO)
+            self.budget.note_read()
+            self.budget.note_success()
+            self.budget.save()
+            if loaded.exists:
+                return True, "Firestore read succeeded."
+            return True, "Firestore answered. The worker health document has not been written yet."
         except Exception as exc:
-            return False, public_text(str(exc))
+            text = public_text(str(exc))
+            self.budget.observe_failure(text, datetime.now())
+            return False, text
 
     def preflight_roundtrip(self, document_id: str) -> tuple[bool, str]:
         """Write, read, and delete one preflight document. No other document is changed."""
@@ -167,12 +199,25 @@ class FirestoreStore:
             return False, "The preflight document id was refused."
         ref = self._collection("api_health").document(document_id)
         try:
-            ref.set({"purpose": "preflight", "ok": True, "tested_at": datetime.utcnow().isoformat()})
-            loaded = ref.get()
+            allowed, message = self.budget.allow(datetime.now(), essential=False)
+            if not allowed:
+                self.budget.note_skip()
+                self.budget.save()
+                return False, message
+            ref.set({"purpose": "preflight", "ok": True, "tested_at": datetime.utcnow().isoformat()}, **_FAST_IO)
+            self.budget.note_write()
+            loaded = ref.get(**_FAST_IO)
+            self.budget.note_read()
             if not loaded.exists or (loaded.to_dict() or {}).get("purpose") != "preflight":
+                self.budget.save()
                 return False, "The preflight document could not be read back."
-            ref.delete()
-            if ref.get().exists:
+            ref.delete(**_FAST_IO)
+            self.budget.note_delete()
+            still_there = ref.get(**_FAST_IO)
+            self.budget.note_read()
+            self.budget.note_success()
+            self.budget.save()
+            if still_there.exists:
                 return False, "The preflight document could not be deleted."
             return True, f"Firestore wrote, read, and deleted api_health/{document_id}."
         except Exception as exc:
@@ -183,106 +228,157 @@ class FirestoreStore:
             return False, public_text(str(exc))
 
     def upsert_instruments(self, documents: list[dict]) -> tuple[bool, str]:
-        try:
-            batch = self.client.batch()
-            count = 0
-            for document in documents:
-                ref = self._collection("instruments").document(document["symbol"])
-                batch.set(ref, redact(document))
-                count += 1
-                if count == 400:
-                    batch.commit()
-                    batch = self.client.batch()
-                    count = 0
-            if count:
-                batch.commit()
-            return True, f"Stored {len(documents)} instruments."
-        except Exception as exc:
-            return False, public_text(str(exc))
+        """One checksum document. The raw instrument file stays on disk."""
+        import hashlib
+        import json
+        raw = json.dumps(documents, sort_keys=True, default=str).encode("utf-8")
+        return self.save_instrument_metadata({
+            "checksum": hashlib.sha256(raw).hexdigest(),
+            "source": "derived instrument list",
+            "symbol_count": len(documents),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+
+    def save_instrument_metadata(self, document: dict) -> tuple[bool, str]:
+        return self._set("instruments_meta", "current", document, essential=False)
 
     def save_breadth(self, document: dict) -> tuple[bool, str]:
-        return self._set("market_breadth", document["trading_date"], document)
+        document_id = str(document.get("id") or document["trading_date"])
+        return self._set("market_breadth", document_id, document, essential=False)
 
     def save_candidates(self, document: dict) -> tuple[bool, str]:
-        return self._set("daily_candidates", document["trading_date"], document)
+        return self._set("daily_candidates", document["trading_date"], document, essential=True)
 
     def signal_exists(self, document_id: str) -> bool:
+        allowed, _message = self.budget.allow(datetime.now(), essential=True)
+        if not allowed:
+            return False
         try:
-            return self._collection("scanner_signals").document(document_id).get().exists
-        except Exception:
+            exists = self._collection("scanner_signals").document(document_id).get(**_FAST_IO).exists
+            self.budget.note_read()
+            self.budget.save()
+            return exists
+        except Exception as exc:
+            self.budget.observe_failure(public_text(str(exc)), datetime.now())
             return False
 
     def save_signal(self, document_id: str, document: dict) -> tuple[bool, str]:
-        try:
-            ref = self._collection("scanner_signals").document(document_id)
-            if ref.get().exists:
-                return True, "Signal already stored."
-            ref.set(redact({**document, "id": document_id}))
-            return True, "Signal stored."
-        except Exception as exc:
-            return False, public_text(str(exc))
+        return self._set("scanner_signals", document_id, {**document, "id": document_id}, essential=True)
 
     def add_log(self, document: dict) -> tuple[bool, str]:
-        try:
-            self._collection("scanner_logs").add(redact(document))
-            return True, "Log stored."
-        except Exception as exc:
-            return False, public_text(str(exc))
+        import hashlib
+        day = str(document.get("day") or datetime.now().date())
+        identity = f"{document.get('category') or 'scanner'}|{document.get('message') or ''}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+        return self._set("scanner_logs", f"{day}_{digest}", {**document, "day": day}, essential=False)
 
     def save_health(self, name: str, document: dict) -> tuple[bool, str]:
-        return self._set("api_health", name, document)
+        return self._set("api_health", name, document, essential=False)
 
     def save_report(self, document: dict) -> tuple[bool, str]:
-        return self._set("daily_reports", document["trading_date"], document)
+        return self._set("daily_reports", document["trading_date"], document, essential=True)
 
     def save_public_config(self, document: dict) -> tuple[bool, str]:
-        return self._set("application_config", "public", document)
+        return self._set("application_config", "public", document, essential=False)
 
     def save_sectors(self, documents: list[dict]) -> tuple[bool, str]:
+        allowed, message = self.budget.allow(datetime.now(), essential=False)
+        if not allowed:
+            self.budget.note_skip()
+            self.budget.save()
+            return False, message
         try:
             batch = self.client.batch()
             for document in documents:
                 ref = self._collection("sectors").document(document["sector"].replace(" ", "_"))
                 batch.set(ref, redact(document))
-            batch.commit()
+            batch.commit(**_FAST_IO)
+            self.budget.note_write(max(1, len(documents)))
+            self.budget.note_success()
+            self.budget.save()
             return True, "Sectors stored."
         except Exception as exc:
-            return False, public_text(str(exc))
+            text = public_text(str(exc))
+            self.budget.observe_failure(text, datetime.now())
+            return False, text
 
     def query_signals(self, trading_date: str | None, limit: int, after_id: str | None) -> tuple[bool, list]:
-        try:
-            query = self._collection("scanner_signals")
-            if trading_date:
-                query = query.where("trading_date", "==", trading_date)
-            rows = [self._plain(item) for item in query.limit(500).stream()]
-            rows.sort(key=lambda row: row.get("id", ""))
-            if after_id:
-                rows = [row for row in rows if row.get("id", "") > after_id]
-            return True, rows[:limit]
-        except Exception as exc:
-            return False, [{"error": public_text(str(exc))}]
+        return self._query("scanner_signals", trading_date, limit, after_id, "trading_date", "id")
 
     def query_reports(self, limit: int) -> tuple[bool, list]:
+        allowed, message = self.budget.allow(datetime.now(), essential=True)
+        if not allowed:
+            self.budget.note_skip()
+            self.budget.save()
+            return False, [{"error": message}]
         try:
-            rows = [self._plain(item) for item in self._collection("daily_reports").limit(max(limit, 30)).stream()]
+            rows = [self._plain(item) for item in self._collection("daily_reports").limit(max(limit, 30)).stream(**_FAST_IO)]
+            self.budget.note_read(max(1, len(rows)))
+            self.budget.note_success()
+            self.budget.save()
             rows.sort(key=lambda row: row.get("trading_date", ""), reverse=True)
             return True, rows[:limit]
         except Exception as exc:
-            return False, [{"error": public_text(str(exc))}]
+            text = public_text(str(exc))
+            self.budget.observe_failure(text, datetime.now())
+            return False, [{"error": text}]
 
     def recent_logs(self, limit: int) -> tuple[bool, list]:
+        allowed, message = self.budget.allow(datetime.now(), essential=False)
+        if not allowed:
+            self.budget.note_skip()
+            self.budget.save()
+            return False, [{"error": message}]
         try:
-            rows = [self._plain(item) for item in self._collection("scanner_logs").limit(limit).stream()]
+            rows = [self._plain(item) for item in self._collection("scanner_logs").limit(limit).stream(**_FAST_IO)]
+            self.budget.note_read(max(1, len(rows)))
+            self.budget.save()
             return True, rows
         except Exception as exc:
-            return False, [{"error": public_text(str(exc))}]
+            text = public_text(str(exc))
+            self.budget.observe_failure(text, datetime.now())
+            return False, [{"error": text}]
 
-    def _set(self, collection: str, document_id: str, document: dict) -> tuple[bool, str]:
+    def _query(self, collection: str, trading_date: str | None, limit: int, after_id: str | None,
+               date_field: str, sort_field: str) -> tuple[bool, list]:
+        allowed, message = self.budget.allow(datetime.now(), essential=True)
+        if not allowed:
+            self.budget.note_skip()
+            self.budget.save()
+            return False, [{"error": message}]
         try:
-            self._collection(collection).document(document_id).set(redact(document))
+            query = self._collection(collection)
+            if trading_date:
+                query = query.where(date_field, "==", trading_date)
+            rows = [self._plain(item) for item in query.limit(500).stream(**_FAST_IO)]
+            self.budget.note_read(max(1, len(rows)))
+            self.budget.note_success()
+            self.budget.save()
+            rows.sort(key=lambda row: row.get(sort_field, ""))
+            if after_id:
+                rows = [row for row in rows if row.get(sort_field, "") > after_id]
+            return True, rows[:limit]
+        except Exception as exc:
+            text = public_text(str(exc))
+            self.budget.observe_failure(text, datetime.now())
+            return False, [{"error": text}]
+
+    def _set(self, collection: str, document_id: str, document: dict, essential: bool = False) -> tuple[bool, str]:
+        allowed, message = self.budget.allow(datetime.now(), essential=essential)
+        if not allowed:
+            self.budget.note_skip()
+            self.budget.save()
+            return False, message
+        try:
+            self._collection(collection).document(document_id).set(redact(document), **_FAST_IO)
+            self.budget.note_write()
+            self.budget.note_success()
+            self.budget.save()
             return True, f"Stored {collection}/{document_id}."
         except Exception as exc:
-            return False, public_text(str(exc))
+            text = public_text(str(exc))
+            self.budget.observe_failure(text, datetime.now())
+            return False, text
 
     @staticmethod
     def _plain(snapshot) -> dict:

@@ -125,6 +125,28 @@ def test_historical_results_are_not_marked_live():
     assert result["alerts"]
 
 
+def test_candle_with_missing_open_is_skipped_instead_of_crashing():
+    from nse_scanner.candles import candles_for_symbol, empty_cache, merge_candles
+    cache = empty_cache("2026-11-23")
+    merge_candles(cache, "INDUSINDBK", [{
+        "ts": "2026-11-23 09:15:00",
+        "open": None,
+        "high": 10,
+        "low": 9,
+        "close": 9.5,
+        "volume": 100,
+    }])
+    assert candles_for_symbol(cache, "INDUSINDBK", datetime(2026, 11, 23, 10, 0), 5) == []
+
+
+def test_daily_candle_keeps_high_low_and_close_when_open_is_missing():
+    rows = parse_groww_candles({"candles": [["2026-11-20T00:00:00", None, 110, 90, 100, 5, None]]})
+    assert rows[0]["close"] == 100
+    assert rows[0]["high"] == 110
+    assert rows[0]["low"] == 90
+    assert rows[0]["open"] is None
+
+
 def test_source_does_not_place_orders(project_root):
     for path in (project_root / "nse_scanner").glob("*.py"):
         text = path.read_text(encoding="utf-8")

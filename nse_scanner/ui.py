@@ -8,6 +8,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+from nse_scanner.cloud_budget import cached_history_rows, cached_reports, load_budget
 from nse_scanner.constituents import (
     active_nifty,
     active_sectors,
@@ -70,9 +71,18 @@ def render() -> None:
     inject_styles()
     st.title("NSE F&O Intraday Scanner")
     st.caption("Signals only. This application does not place orders.")
+    if load_settings().get("developer_mode"):
+        st.warning(
+            "Developer mode is on. Clock limits are bypassed for this test. "
+            "These results are stored separately and do not change the production scan."
+        )
+        st.sidebar.caption("Developer mode")
     status = read_status()
     if status.get("scanner_state") not in ("running", "waiting", "closed"):
-        st.info("Live scanning is idle until Groww, Firebase and the approved symbol lists are ready. Open Settings to finish setup.")
+        st.warning(status.get("message") or "Live scanning is not ready.")
+        failed = [item for item in (status.get("readiness") or {}).get("checks") or [] if not item.get("passed")]
+        for item in failed:
+            st.caption(f"{item.get('name')}: {item.get('detail')}")
     page = st.sidebar.radio("Sections", PAGES, label_visibility="collapsed")
     st.sidebar.caption("Market clock: Asia/Kolkata")
     {
@@ -133,8 +143,16 @@ def page_dashboard(status: dict) -> None:
     summary = board.get("summary") or {}
     health = status.get("health") or {}
     banner = board.get("banner") or market.get("status") or "NO RESULT YET"
-    st.subheader(f"Market direction: {banner}")
-    st.write(board.get("reason") or status.get("message") or "The scanner has not published a result yet.")
+    if live.get("complete") and banner in ("BLOCKED", "WAITING FOR 9:30"):
+        st.subheader(f"Live market: {live.get('status')}")
+    else:
+        st.subheader(f"Market direction: {banner}")
+    reason = status.get("message") or board.get("reason") or "The scanner has not published a result yet."
+    selection_reason = (status.get("selection") or {}).get("reason")
+    if selection_reason and selection_reason not in reason:
+        reason = f"{reason} {selection_reason}"
+    st.write(reason)
+    _cloud_caption()
     eligibility = policy.get("eligibility") or "Signal eligibility is published after the scanner locks the 9:30 list."
     if "still scanned" in eligibility:
         signal_state = "Still scanned"
@@ -149,9 +167,10 @@ def page_dashboard(status: dict) -> None:
     st.caption(eligibility)
     nifty = market.get("nifty50") or {}
     fno = market.get("fno") or {}
+    breadth_ready = bool(market.get("complete"))
     columns = st.columns(4)
-    columns[0].metric("Nifty 50 advances", f"{nifty.get('adv_pct', '—')}%")
-    columns[1].metric("F&O advances", f"{fno.get('adv_pct', '—')}%")
+    columns[0].metric("Nifty 50 advances", f"{float(nifty.get('adv_pct')):.1f}%" if breadth_ready else "—")
+    columns[1].metric("F&O advances", f"{float(fno.get('adv_pct')):.1f}%" if breadth_ready else "—")
     columns[2].metric("Selected", len(summary.get("buy", [])) + len(summary.get("short", [])) + len(summary.get("wait", [])))
     columns[3].metric("Last update", (status.get("updated_at") or "—")[-8:])
     columns = st.columns(4)
@@ -174,7 +193,7 @@ def page_dashboard(status: dict) -> None:
     rows = board.get("rows") or []
     st.subheader("Stock results")
     if not rows:
-        st.caption("No stock list is available for this decision. Sample stocks are not shown.")
+        st.caption(board.get("reason") or "No stock list is available for this decision. Sample stocks are not shown.")
     else:
         choice = st.selectbox("Show", ["BUY, SHORT and WAIT", "All decisions", "BUY", "SHORT", "WAIT", "EXCLUDED", "BLOCKED"])
         visible = rows
@@ -187,15 +206,15 @@ def page_dashboard(status: dict) -> None:
         shown = frame.drop(columns=hidden) if len(frame) else frame
         if len(shown) and "Final Decision" in shown.columns:
             styled = shown.style.map(_paint, subset=["Final Decision"])
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.dataframe(styled, width="stretch", hide_index=True)
         else:
-            st.dataframe(shown, use_container_width=True, hide_index=True)
+            st.dataframe(shown, width="stretch", hide_index=True)
         st.download_button(
             "Download this table as CSV",
             shown.to_csv(index=False) if len(shown) else "Symbol\n",
             file_name="nse_fno_stock_results.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         if visible:
             symbol = st.selectbox("Inspect one stock", [row["Symbol"] for row in visible])
@@ -211,7 +230,7 @@ def page_dashboard(status: dict) -> None:
                 }
                 for item in chosen.get("checks") or []
             ])
-            st.dataframe(proof, use_container_width=True, hide_index=True)
+            st.dataframe(proof, width="stretch", hide_index=True)
             for line in chosen.get("proof") or []:
                 st.caption(line)
     st.caption(
@@ -231,7 +250,7 @@ def page_checklist(status: dict) -> None:
         st.success("Every listed client rule is implemented and tested.")
     else:
         st.warning("The client strategy is not fully covered. Items below that are blocked, missing data, or waiting for a definition are not treated as complete.")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     from nse_scanner.providers import data_source_rows
     from nse_scanner.settings import load_settings
     settings = load_settings()
@@ -242,7 +261,7 @@ def page_checklist(status: dict) -> None:
             settings.get("last_firebase_test"),
             str(status.get("sector_block") or ""),
         )),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     methods = board.get("methods") or {}
@@ -266,7 +285,7 @@ def page_candidates(status: dict) -> None:
         return
     frame = pd.DataFrame(rows)
     keep = [column for column in ["symbol", "name", "ltp", "change_pct", "sector", "sources", "current_price", "current_price_status"] if column in frame.columns]
-    st.dataframe(frame[keep], use_container_width=True, hide_index=True)
+    st.dataframe(frame[keep], width="stretch", hide_index=True)
     direction = (status.get("selection") or {}).get("direction")
     st.caption(f"Locked direction: {direction or 'none'}. Current price is shown only while the latest Groww price is fresh.")
 
@@ -281,7 +300,7 @@ def page_signals(status: dict) -> None:
         "symbol", "direction", "setup", "candle_time", "open", "high", "low", "close", "volume",
         "previous_day_high", "previous_day_low", "current_price", "current_price_status", "sources",
     ] if column in frame.columns]
-    st.dataframe(frame[columns], use_container_width=True, hide_index=True)
+    st.dataframe(frame[columns], width="stretch", hide_index=True)
 
 
 def page_scanner(_status: dict) -> None:
@@ -303,7 +322,7 @@ def page_scanner(_status: dict) -> None:
     example = "09:15,100,102,99,101,1000\n09:20,101,103,100,102,800\n09:25,102,104,101,103,700\n09:30,103,104,101,102,500"
     raw = st.text_area("Candles: time, open, high, low, close, volume", value=example, height=160)
     st.caption("The sample above is only a format example. It is not a live signal.")
-    if st.button("Test setup rules", type="primary", use_container_width=True):
+    if st.button("Test setup rules", type="primary", width="stretch"):
         try:
             candles = []
             today = datetime.now().date()
@@ -317,10 +336,10 @@ def page_scanner(_status: dict) -> None:
             explained = explain_setups(candles, direction, pdh, pdl)
             alerts = explained["alerts"]
             if alerts:
-                st.dataframe(pd.DataFrame(alerts), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(alerts), width="stretch", hide_index=True)
             else:
                 st.warning("No setup matched these candles.")
-            st.dataframe(pd.DataFrame(explained["checks"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(explained["checks"]), width="stretch", hide_index=True)
         except Exception as exc:
             st.error(f"Input error: {exc}")
     st.subheader("Candidate file check")
@@ -331,26 +350,26 @@ def page_scanner(_status: dict) -> None:
             frame["eligible"] = frame["change_pct"].apply(
                 lambda value: eligible(float(value), market["direction"] or "NO TRADE", market_status=market["status"])
             )
-            st.dataframe(frame[frame["eligible"]], use_container_width=True, hide_index=True)
+            st.dataframe(frame[frame["eligible"]], width="stretch", hide_index=True)
         else:
             st.warning("The CSV needs a change_pct column.")
     st.subheader("Historical test")
     st.caption("Historical output stays on this page and is never stored as a live signal.")
     history_text = st.text_area("Historical candles", value=example, height=140, key="historical_candles")
     move = st.number_input("Daily move percent for the eligibility check", value=1.0, format="%.2f")
-    if st.button("Run historical test", use_container_width=True):
+    if st.button("Run historical test", width="stretch"):
         try:
             result = run_historical(nifty_adv, nifty_dec, fno_adv, fno_dec, parse_candle_text(history_text), direction, pdh, pdl, move)
             st.warning(result["note"])
             if result["alerts"]:
-                st.dataframe(pd.DataFrame(result["alerts"]), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(result["alerts"]), width="stretch", hide_index=True)
             else:
                 st.info("The historical candles produced no qualifying setup.")
         except Exception as exc:
             st.error(f"Input error: {exc}")
     st.subheader("Rule validation report")
     st.caption("This replays fixed completed candles for all three setups. It does not calculate profit and it does not create a live signal.")
-    if st.button("Run historical rule validation", use_container_width=True):
+    if st.button("Run historical rule validation", width="stretch"):
         validation = write_validation_report()
         if validation["passed"]:
             st.success(f"Passed {validation['case_count']} historical rule checks.")
@@ -359,7 +378,7 @@ def page_scanner(_status: dict) -> None:
         st.caption(validation["setup3_discrepancy"])
         st.caption(validation["reversal_difference"])
         st.caption(validation["profitability"])
-        st.dataframe(pd.DataFrame(validation["cases"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(validation["cases"]), width="stretch", hide_index=True)
 
 
 def _store_or_none():
@@ -372,27 +391,56 @@ def _store_or_none():
         return None
 
 
+def _cloud_caption() -> None:
+    try:
+        view = load_budget().public_view()
+    except Exception:
+        return
+    if view.get("state") == "open" and not view.get("pending"):
+        st.caption(view.get("status") or "")
+        return
+    st.warning(view.get("status") or "Firestore sync is paused. The local scan continues.")
+
+
+def _usage_table() -> None:
+    try:
+        view = load_budget().public_view()
+    except Exception as exc:
+        st.caption(f"Firestore usage is not available: {exc}")
+        return
+    st.subheader("Firestore usage")
+    st.caption("Estimated by this application for the current Pacific quota day. This is not an official Firebase quota.")
+    st.dataframe(pd.DataFrame([
+        {"Check": "Circuit breaker", "State": view.get("state")},
+        {"Check": "Estimated writes today", "State": view.get("writes")},
+        {"Check": "Estimated reads today", "State": view.get("reads")},
+        {"Check": "Estimated deletes today", "State": view.get("deletes")},
+        {"Check": "Failed operations", "State": view.get("failed")},
+        {"Check": "Skipped duplicate writes", "State": view.get("skipped")},
+        {"Check": "Pending local sync", "State": view.get("pending")},
+        {"Check": "Write safety target", "State": view.get("write_target")},
+        {"Check": "Next reset", "State": view.get("reset_at") or "not waiting"},
+        {"Check": "Next retry", "State": view.get("retry_at") or "not waiting"},
+    ]), width="stretch", hide_index=True)
+    st.write(view.get("status") or "")
+
+
 def page_history(_status: dict) -> None:
-    st.caption("Live history comes from Firestore. Historical tests are not listed here.")
+    st.caption("History is read from the local cache. Opening this page does not query Firestore.")
     trading_date = st.text_input("Trading date (YYYY-MM-DD)", value="")
     symbol = st.text_input("Stock symbol", value="").upper().strip()
     setup = st.selectbox("Setup", ["All", "SETUP 1", "SETUP 2", "SETUP 3"])
     direction = st.selectbox("Direction", ["All", "LONG", "SHORT"])
     source = st.text_input("Selection source contains", value="")
-    store = _store_or_none()
-    rows = []
-    if store:
-        ok, loaded = store.query_signals(trading_date or None, 500, None)
-        rows = loaded if ok else []
-        if not ok and loaded:
-            st.error(loaded[0].get("error", "Could not read signals."))
-            return
-    else:
-        rows = [row for row in (_status.get("signals") or []) if row.get("origin") == "live"]
-        st.caption("Showing the current scanner status only, because Firebase is not connected.")
+    rows = list(cached_history_rows())
+    for row in _status.get("signals") or []:
+        if isinstance(row, dict) and row.get("id") and row.get("id") not in {item.get("id") for item in rows}:
+            rows.append(row)
     filtered = []
     for row in rows:
-        if not isinstance(row, dict) or row.get("origin") not in (None, "live"):
+        if not isinstance(row, dict) or row.get("origin") not in (None, "live", "developer"):
+            continue
+        if trading_date and row.get("trading_date") != trading_date:
             continue
         if symbol and row.get("symbol") != symbol:
             continue
@@ -406,30 +454,24 @@ def page_history(_status: dict) -> None:
     if not filtered:
         st.info("No stored live signals match these filters.")
         return
-    st.dataframe(pd.DataFrame(filtered), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(filtered), width="stretch", hide_index=True)
 
 
 def page_reports(_status: dict) -> None:
-    store = _store_or_none()
-    if not store:
-        st.info("Connect Firebase to read daily reports.")
-        return
-    ok, rows = store.query_reports(30)
-    if not ok:
-        st.error(rows[0].get("error") if rows else "Could not read reports.")
-        return
-    live = [row for row in rows if row.get("origin") == "live"]
+    st.caption("Daily reports are read from the local cache. Opening this page does not query Firestore.")
+    rows = cached_reports()
+    live = [row for row in rows if row.get("origin") in ("live", "developer")]
     if not live:
         st.info("No live daily report is stored yet.")
         return
     report_frame = pd.DataFrame(live)
     columns = [column for column in ["trading_date", "market_status", "candidate_count", "signal_count", "note"] if column in report_frame.columns]
-    st.dataframe(report_frame[columns], use_container_width=True, hide_index=True)
+    st.dataframe(report_frame[columns], width="stretch", hide_index=True)
     choice = st.selectbox("Open report", [row["trading_date"] for row in live])
     selected = next(row for row in live if row["trading_date"] == choice)
     st.json({key: value for key, value in selected.items() if key != "signals"})
     if selected.get("signals"):
-        st.dataframe(pd.DataFrame(selected["signals"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(selected["signals"]), width="stretch", hide_index=True)
 
 
 def page_api(status: dict) -> None:
@@ -444,15 +486,17 @@ def page_api(status: dict) -> None:
         {"Check": "Live feed", "State": health.get("feed") or "not started"},
         {"Check": "Last Groww success", "State": health.get("last_groww_success") or "none"},
         {"Check": "Database", "State": health.get("database") or "not connected"},
+        {"Check": "Firestore circuit breaker", "State": (health.get("firestore") or {}).get("state") or "not reported"},
+        {"Check": "Pending local sync", "State": (health.get("firestore") or {}).get("pending", 0)},
         {"Check": "Last scanner update", "State": status.get("updated_at") or "none"},
         {"Check": "Latest error", "State": health.get("last_error") or "none"},
     ])
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
     permissions = settings.get("last_groww_permissions") or {}
     if permissions.get("results"):
         st.subheader("Groww permission checks")
         st.caption("Authentication can succeed while live data, history, or open interest stays forbidden. A failed check is never filled with a sample price.")
-        st.dataframe(pd.DataFrame(permissions["results"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(permissions["results"]), width="stretch", hide_index=True)
         st.caption(f"Checked at {permissions.get('at') or '—'}")
     lists = status.get("lists") or {}
     if lists:
@@ -467,11 +511,22 @@ def page_api(status: dict) -> None:
             st.json(matches)
     if health.get("errors"):
         st.subheader("Recent scanner errors")
-        st.dataframe(pd.DataFrame({"error": health["errors"]}), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame({"error": health["errors"]}), width="stretch", hide_index=True)
+    _usage_table()
 
 
 def page_settings(_status: dict) -> None:
     settings = load_settings()
+    st.subheader("Developer mode")
+    developer = st.checkbox("Developer mode", value=bool(settings.get("developer_mode")))
+    st.caption(
+        "Testing only. Market hours, weekends, holidays, quote age, and the 9:30 deadline do not block a test. "
+        "Test files stay in the developer folder. Test database records use separate collections. "
+        "Production mode keeps the current rules and the current files while this is off."
+    )
+    if developer != bool(settings.get("developer_mode")):
+        save_settings({"developer_mode": developer})
+        st.rerun()
     secrets = secret_status()
     universe = read_json("fno_universe.json", {})
     now = datetime.now()
@@ -500,13 +555,13 @@ def page_settings(_status: dict) -> None:
         st.error("The scanner is not live-ready. Missing items above must be completed. No sample market is shown in their place.")
     running = worker_running()
     left, right, third = st.columns(3)
-    if left.button("Start scanner", use_container_width=True, disabled=running):
+    if left.button("Start scanner", width="stretch", disabled=running):
         ok, message = start_worker()
         st.session_state["control_message"] = message if ok else message
-    if right.button("Stop scanner", use_container_width=True):
+    if right.button("Stop scanner", width="stretch"):
         ok, message = stop_worker()
         st.session_state["control_message"] = message
-    if third.button("Restart scanner", use_container_width=True):
+    if third.button("Restart scanner", width="stretch"):
         stop_worker()
         ok, message = start_worker()
         st.session_state["control_message"] = message
@@ -520,11 +575,11 @@ def page_settings(_status: dict) -> None:
         api_secret = st.text_input("API secret", type="password", placeholder="Saved" if secrets["groww_api_secret"] else "Required for API key flow")
         totp_secret = st.text_input("TOTP secret", type="password", placeholder="Saved" if secrets["groww_totp_secret"] else "Required for TOTP flow")
         st.caption(f"Saved key: {'yes' if secrets['groww_api_key'] else 'no'} · Last success: {(settings.get('last_groww_test') or {}).get('at') or 'never'}")
-        if st.button("Save Groww settings", use_container_width=True):
+        if st.button("Save Groww settings", width="stretch"):
             save_settings({"groww_auth_mode": mode})
             update_secrets(groww_api_key=api_key, groww_api_secret=api_secret, groww_totp_secret=totp_secret)
             st.success("Groww settings saved. Secrets stay outside the project and are not shown again.")
-        if st.button("Test Groww permissions", use_container_width=True):
+        if st.button("Test Groww permissions", width="stretch"):
             client = GrowwClient(load_settings())
             results = client.probe_permissions()
             auth = next(row for row in results if row["name"] == "Authentication")
@@ -535,13 +590,13 @@ def page_settings(_status: dict) -> None:
                 "last_groww_permissions": {"at": checked_at, "results": results},
                 "last_oi_probe": {"ok": oi["ok"], "message": oi["message"], "at": checked_at},
             })
-            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
             st.caption("A successful login does not mean live prices, candles, or open interest are included in the subscription.")
 
     with st.expander("Firebase", expanded=False):
         uploaded = st.file_uploader("Service account JSON", type=["json"])
         st.caption(f"Service account: {'saved' if secrets['firebase_service_account'] else 'missing'}")
-        if uploaded is not None and st.button("Save service account", use_container_width=True):
+        if uploaded is not None and st.button("Save service account", width="stretch"):
             try:
                 payload = json.loads(uploaded.getvalue().decode("utf-8"))
                 if payload.get("type") != "service_account" or not payload.get("private_key"):
@@ -550,9 +605,20 @@ def page_settings(_status: dict) -> None:
                 st.success("Service account stored outside the project. Its contents are not displayed.")
             except Exception as exc:
                 st.error(str(exc))
-        if st.button("Test Firestore read and write", use_container_width=True):
+        target = st.number_input(
+            "Firestore write safety target",
+            min_value=100,
+            value=int(settings.get("firestore_write_target") or 2000),
+            help="Application estimate for one trading day. This does not change the Firebase quota.",
+        )
+        st.caption("Nonessential cloud writes pause at this estimate. Signals, the locked list, and the daily report can still sync. This is not an official Firebase quota.")
+        if int(target) != int(settings.get("firestore_write_target") or 2000):
+            save_settings({"firestore_write_target": int(target)})
+            st.rerun()
+        _usage_table()
+        if st.button("Test Firestore connection", width="stretch"):
             try:
-                ok, message = FirestoreStore.connect().ping()
+                ok, message = FirestoreStore.connect().check_connection()
             except Exception as exc:
                 ok, message = False, str(exc)
             save_settings({"last_firebase_test": {"ok": ok, "message": message, "at": datetime.now().isoformat(timespec="seconds")}})
@@ -608,7 +674,7 @@ def page_settings(_status: dict) -> None:
                     "breadth_reversal_protection_change_approved": approve_reversal}
         if core_changes(proposed) and not approve_core:
             st.warning("These values differ from the approved defaults and will not be saved until you confirm them.")
-        if st.button("Save market settings", use_container_width=True):
+        if st.button("Save market settings", width="stretch"):
             if core_changes(proposed) and not approve_core:
                 st.error("Core changes were not saved.")
             elif denominator != APPROVED_BREADTH_DENOMINATOR and not approve_denominator:
@@ -651,7 +717,7 @@ def page_settings(_status: dict) -> None:
         index_approved = st.checkbox("I confirm these index symbols", value=bool(settings["sector_method_approved"]))
         constituents_approved = st.checkbox("I confirm the uploaded sector constituent file", value=bool(settings["sector_constituents_approved"]))
         sector_file = st.file_uploader("Sector constituent fallback CSV", type=["csv"], key="sector_csv")
-        if sector_file is not None and st.button("Save sector fallback", use_container_width=True):
+        if sector_file is not None and st.button("Save sector fallback", width="stretch"):
             destination = lists_dir() / "sectors.csv"
             destination.write_bytes(sector_file.getvalue())
             try:
@@ -660,7 +726,7 @@ def page_settings(_status: dict) -> None:
             except ValueError as exc:
                 ok, message = False, str(exc)
             st.success(message) if ok else st.error(message)
-        if st.button("Save selection settings", use_container_width=True):
+        if st.button("Save selection settings", width="stretch"):
             counts_changed = any(
                 value != DEFAULTS[name]
                 for name, value in {"top_n": top_n, "sector_count": sector_count, "stocks_per_sector": per_sector}.items()
@@ -695,12 +761,12 @@ def page_settings(_status: dict) -> None:
         st.write(nifty_detail)
         if nifty_symbols:
             st.caption(f"Active Nifty 50 source: {nifty_origin}. {len(nifty_symbols)} symbols.")
-            st.dataframe(pd.DataFrame({"symbol": nifty_symbols}), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame({"symbol": nifty_symbols}), width="stretch", hide_index=True)
         if sector_errors:
             st.warning(" ".join(sector_errors))
         elif sector_symbols:
             st.success("All 13 sector constituent lists are usable.")
-        if st.button("Refresh official NSE lists", use_container_width=True):
+        if st.button("Refresh official NSE lists", width="stretch"):
             refreshed = refresh_official_lists(datetime.now(), max_age_hours=max_age, force=True)
             nifty = refreshed.get("nifty50") or {}
             sectors = refreshed.get("sectors") or {}
@@ -716,7 +782,7 @@ def page_settings(_status: dict) -> None:
         if template.exists():
             st.download_button("Download Nifty 50 template", template.read_text(encoding="utf-8"), file_name="nifty50_constituents.csv")
         nifty_file = st.file_uploader("Nifty 50 fallback CSV", type=["csv"], key="nifty_csv")
-        if nifty_file is not None and st.button("Save Nifty 50 fallback", use_container_width=True):
+        if nifty_file is not None and st.button("Save Nifty 50 fallback", width="stretch"):
             destination = lists_dir() / "nifty50.csv"
             destination.write_bytes(nifty_file.getvalue())
             try:
@@ -727,7 +793,7 @@ def page_settings(_status: dict) -> None:
         sector_template = templates_dir() / "sector_constituents.csv"
         if sector_template.exists():
             st.download_button("Download sector template", sector_template.read_text(encoding="utf-8"), file_name="sector_constituents.csv")
-        if st.button("Refresh Groww instrument master", use_container_width=True):
+        if st.button("Refresh Groww instrument master", width="stretch"):
             client = GrowwClient(load_settings())
             ok, message = client.authenticate()
             if not ok:
@@ -743,7 +809,7 @@ def page_settings(_status: dict) -> None:
                                                  "generated_at": datetime.now().isoformat(sep=" ", timespec="seconds")})
                 save_settings({"fno_universe_approved": False, "fno_universe_hash": ""})
                 st.success(f"Derived {len(derived)} F&O equities. Approval was cleared because this is a new list.")
-                st.dataframe(pd.DataFrame(derived)[["symbol", "name"]], use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(derived)[["symbol", "name"]], width="stretch", hide_index=True)
         symbols = universe.get("symbols") or []
         if symbols and universe.get("hash"):
             st.caption(f"Derived F&O equities: {universe.get('count', len(symbols))}. Hash {universe.get('hash', '')[:12]}.")
@@ -751,11 +817,11 @@ def page_settings(_status: dict) -> None:
             st.caption(f"This derived list is {state}.")
             preview = pd.DataFrame(symbols)
             columns = [column for column in ["symbol", "name"] if column in preview.columns]
-            st.dataframe(preview[columns], use_container_width=True, hide_index=True)
-            if st.button("Approve derived F&O universe", use_container_width=True):
+            st.dataframe(preview[columns], width="stretch", hide_index=True)
+            if st.button("Approve derived F&O universe", width="stretch"):
                 save_settings({"fno_universe_approved": True, "fno_universe_hash": universe.get("hash", "")})
                 st.success("F&O universe approved.")
-            if st.button("Clear F&O universe approval", use_container_width=True):
+            if st.button("Clear F&O universe approval", width="stretch"):
                 save_settings({"fno_universe_approved": False, "fno_universe_hash": ""})
 
     with st.expander("Notifications", expanded=False):
@@ -770,7 +836,7 @@ def page_settings(_status: dict) -> None:
         sender = st.text_input("From address", value=settings.get("smtp_from") or "")
         recipient = st.text_input("To address", value=settings.get("smtp_to") or "")
         password = st.text_input("SMTP password", type="password", placeholder="Saved" if secrets["smtp_password"] else "")
-        if st.button("Save notifications", use_container_width=True):
+        if st.button("Save notifications", width="stretch"):
             save_settings({
                 "telegram_enabled": telegram, "telegram_chat_id": chat, "email_enabled": email,
                 "smtp_host": host, "smtp_port": port, "smtp_username": username,
@@ -778,7 +844,7 @@ def page_settings(_status: dict) -> None:
             })
             update_secrets(telegram_token=token, smtp_password=password)
             st.success("Notification settings saved.")
-        if st.button("Send test notification", use_container_width=True):
+        if st.button("Send test notification", width="stretch"):
             from nse_scanner.notify import notify_all
             st.write(notify_all(load_settings(), "NSE F&O scanner test message. This is not a trade signal."))
 
@@ -789,7 +855,7 @@ def page_settings(_status: dict) -> None:
         st.write(f"Database: {health.get('database') or 'not connected'}")
         st.write(f"Data freshness window: {settings.get('quote_max_age_seconds')} seconds")
         age = int(st.number_input("Quote freshness seconds", min_value=5, value=int(settings["quote_max_age_seconds"])))
-        if st.button("Save freshness window", use_container_width=True):
+        if st.button("Save freshness window", width="stretch"):
             save_settings({"quote_max_age_seconds": age})
         log_path = runtime_dir() / "scanner.log"
         if log_path.exists():

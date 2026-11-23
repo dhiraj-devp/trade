@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -9,7 +10,7 @@ import sys
 from datetime import datetime
 
 from nse_scanner.paths import project_root, runtime_dir
-from nse_scanner.state import read_json, read_status, write_json
+from nse_scanner.state import _write
 
 
 def stop_path():
@@ -35,7 +36,18 @@ def stop_requested() -> bool:
 
 
 def write_worker_record() -> None:
-    write_json("worker.json", {"pid": os.getpid(), "started_at": datetime.now().isoformat(sep=" ", timespec="seconds")})
+    _write(pid_path(), {"pid": os.getpid(), "started_at": datetime.now().isoformat(sep=" ", timespec="seconds")})
+
+
+def read_worker_record() -> dict:
+    path = pid_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def clear_worker_record() -> None:
@@ -59,16 +71,12 @@ def _command_line(pid: int) -> str:
 
 
 def worker_running() -> bool:
-    record = read_json("worker.json", {})
+    record = read_worker_record()
     pid = record.get("pid")
     if not pid:
         return False
     command = _command_line(int(pid))
-    if "nse_scanner.worker" not in command and "nse_scanner/worker" not in command:
-        return False
-    status = read_status()
-    updated = status.get("updated_at") or ""
-    return bool(updated)
+    return "nse_scanner.worker" in command or "nse_scanner/worker" in command
 
 
 def start_worker() -> tuple[bool, str]:
@@ -87,7 +95,7 @@ def start_worker() -> tuple[bool, str]:
 
 def stop_worker() -> tuple[bool, str]:
     request_stop()
-    record = read_json("worker.json", {})
+    record = read_worker_record()
     pid = record.get("pid")
     if not pid:
         return True, "Stop requested. No scanner pid is recorded."

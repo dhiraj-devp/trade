@@ -68,3 +68,13 @@ def readiness(settings: dict, universe_hash: str = "", nifty_symbols: list[str] 
         add("Sector method", True, "Sector selection is turned off.")
     ready = all(item["passed"] for item in checks)
     return {"ready": ready, "checks": checks}
+
+
+def scan_is_blocked(report: dict) -> bool:
+    """Firebase being down does not stop the local scan. Market data checks still do."""
+    for item in report.get("checks") or []:
+        if str(item.get("name") or "").startswith("Firebase"):
+            continue
+        if not item.get("passed"):
+            return True
+    return False

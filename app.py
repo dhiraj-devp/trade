@@ -1,3 +1,3 @@
-from nse_scanner.ui import render
+import nse_scanner.ui as dashboard
 
-render()
+dashboard.render()

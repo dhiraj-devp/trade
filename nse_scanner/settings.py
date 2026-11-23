@@ -86,6 +86,8 @@ DEFAULTS = {
     "last_groww_test": {},
     "last_firebase_test": {},
     "wizard_seen": False,
+    "developer_mode": False,
+    "firestore_write_target": 2000,
 }
 
 CORE_FIELDS = (
@@ -168,6 +170,23 @@ def strategy_is_approved(data: dict) -> tuple[bool, str]:
     if data.get("breadth_reversal_protection") and not data.get("breadth_reversal_protection_change_approved"):
         return False, "Blocking new signals after the locked breadth changes is an extra protection and is not approved."
     return True, "Strategy settings are at the approved defaults or an explicit change has been confirmed."
+
+
+def developer_mode_enabled(settings: dict | None = None) -> bool:
+    data = settings if settings is not None else load_settings()
+    return bool(data.get("developer_mode"))
+
+
+def session_limits_apply(settings: dict) -> bool:
+    """Production keeps the market clock. Developer mode is for testing and ignores it."""
+    return not developer_mode_enabled(settings)
+
+
+def quote_max_age_seconds(settings: dict) -> float:
+    age = float(settings.get("quote_max_age_seconds") or 30)
+    if developer_mode_enabled(settings):
+        return max(age, 86_400.0)
+    return age
 
 
 def public_settings() -> dict:

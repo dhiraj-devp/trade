@@ -7,12 +7,12 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from nse_scanner.paths import runtime_dir
+from nse_scanner.paths import data_dir
 from scanner_rules import Candle, completed_candle, missing_session_slots, parse_candle_time
 
 
 def _path():
-    return runtime_dir() / "candle_cache.json"
+    return data_dir() / "candle_cache.json"
 
 
 def empty_cache(trading_date: str) -> dict:
@@ -50,17 +50,18 @@ def parse_groww_candles(payload: dict) -> list[dict]:
             continue
         try:
             ts = parse_candle_time(item[0])
+            high = float(item[2])
+            low = float(item[3])
+            close = float(item[4])
             row = {
                 "ts": ts.strftime("%Y-%m-%d %H:%M:%S"),
-                "open": float(item[1]),
-                "high": float(item[2]),
-                "low": float(item[3]),
-                "close": float(item[4]),
+                "open": None if item[1] is None else float(item[1]),
+                "high": high,
+                "low": low,
+                "close": close,
                 "volume": float(item[5]) if len(item) > 5 and item[5] is not None else None,
             }
         except (TypeError, ValueError):
-            continue
-        if row["volume"] is None:
             continue
         rows.append(row)
     return rows
@@ -92,14 +93,19 @@ def store_previous_day(cache: dict, symbol: str, rows: list[dict], trading_date:
 def candles_for_symbol(cache: dict, symbol: str, now: datetime, interval_minutes: int = 5) -> list[Candle]:
     candles = []
     for row in cache.get("candles", {}).get(symbol, []):
-        candle = Candle(
-            ts=datetime.strptime(row["ts"], "%Y-%m-%d %H:%M:%S"),
-            open=float(row["open"]),
-            high=float(row["high"]),
-            low=float(row["low"]),
-            close=float(row["close"]),
-            volume=float(row["volume"]),
-        )
+        if any(row.get(name) is None for name in ("open", "high", "low", "close", "volume")):
+            continue
+        try:
+            candle = Candle(
+                ts=datetime.strptime(row["ts"], "%Y-%m-%d %H:%M:%S"),
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row["volume"]),
+            )
+        except (TypeError, ValueError):
+            continue
         if completed_candle(candle, now, interval_minutes):
             candles.append(candle)
     candles.sort(key=lambda candle: candle.ts)

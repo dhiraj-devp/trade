@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 
 from nse_scanner.paths import runtime_dir
 from nse_scanner.redact import public_text
@@ -20,7 +21,12 @@ def setup_logging() -> logging.Logger:
     if logger.handlers:
         return logger
     formatter = RedactingFormatter("%(asctime)s %(levelname)s %(message)s")
-    file_handler = logging.FileHandler(runtime_dir() / "scanner.log", encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        runtime_dir() / "scanner.log",
+        maxBytes=1_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
     file_handler.setFormatter(formatter)
     stream = logging.StreamHandler()
     stream.setFormatter(formatter)
