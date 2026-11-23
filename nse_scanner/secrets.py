@@ -71,15 +71,41 @@ def secrets_path() -> Path:
 
 
 def load_secrets() -> dict:
-    path = secrets_path()
-    if not path.exists():
-        return {}
+    data = {}
+    # First check Streamlit secrets (for Streamlit Community Cloud)
     try:
-        raw = _unprotect(path.read_bytes())
-        data = json.loads(raw.decode("utf-8"))
+        import streamlit as st
+        if hasattr(st, "secrets") and st.secrets:
+            for key in ("groww_api_key", "groww_api_secret", "groww_totp_secret", "telegram_token", "smtp_password"):
+                if key in st.secrets:
+                    val = str(st.secrets[key]).strip()
+                    if val:
+                        data[key] = val
+            if "firebase_service_account" in st.secrets:
+                fb = st.secrets["firebase_service_account"]
+                if hasattr(fb, "to_dict"):
+                    data["firebase_service_account"] = fb.to_dict()
+                elif isinstance(fb, dict):
+                    data["firebase_service_account"] = dict(fb)
+                elif isinstance(fb, str):
+                    try:
+                        data["firebase_service_account"] = json.loads(fb)
+                    except Exception:
+                        pass
     except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+        pass
+
+    path = secrets_path()
+    if path.exists():
+        try:
+            raw = _unprotect(path.read_bytes())
+            file_data = json.loads(raw.decode("utf-8"))
+            if isinstance(file_data, dict):
+                for k, v in file_data.items():
+                    data.setdefault(k, v)
+        except Exception:
+            pass
+    return data
 
 
 def save_secrets(data: dict) -> None:
@@ -123,7 +149,15 @@ def secret_status() -> dict:
 
 def firebase_certificate() -> dict | None:
     data = load_secrets().get("firebase_service_account")
-    return data if isinstance(data, dict) else None
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, str):
+        try:
+            parsed = json.loads(data)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
 
 
 def running_as_test() -> bool:

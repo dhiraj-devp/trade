@@ -17,6 +17,9 @@ class Store(Protocol):
     def upsert_instruments(self, documents: list[dict]) -> tuple[bool, str]: ...
     def save_breadth(self, document: dict) -> tuple[bool, str]: ...
     def save_candidates(self, document: dict) -> tuple[bool, str]: ...
+    def get_candidates(self, trading_date: str) -> tuple[bool, dict | None]: ...
+    def get_monitoring_state(self, trading_date: str) -> tuple[bool, dict | None]: ...
+    def save_monitoring_state(self, trading_date: str, document: dict) -> tuple[bool, str]: ...
     def signal_exists(self, document_id: str) -> bool: ...
     def save_signal(self, document_id: str, document: dict) -> tuple[bool, str]: ...
     def add_log(self, document: dict) -> tuple[bool, str]: ...
@@ -52,6 +55,7 @@ class MemoryStore:
         self.sectors = {}
         self.breadth = {}
         self.candidates = {}
+        self.monitoring_state = {}
         self.signals = {}
         self.logs = []
         self.health = {}
@@ -83,6 +87,22 @@ class MemoryStore:
             return False, "Store unavailable."
         self.candidates[document["trading_date"]] = redact(document)
         return True, "Candidates stored."
+
+    def get_candidates(self, trading_date: str) -> tuple[bool, dict | None]:
+        if self.fail:
+            return False, None
+        return True, self.candidates.get(trading_date)
+
+    def get_monitoring_state(self, trading_date: str) -> tuple[bool, dict | None]:
+        if self.fail:
+            return False, None
+        return True, self.monitoring_state.get(trading_date)
+
+    def save_monitoring_state(self, trading_date: str, document: dict) -> tuple[bool, str]:
+        if self.fail:
+            return False, "Store unavailable."
+        self.monitoring_state[trading_date] = redact(document)
+        return True, "Monitoring state stored."
 
     def signal_exists(self, document_id: str) -> bool:
         return document_id in self.signals
@@ -248,6 +268,47 @@ class FirestoreStore:
 
     def save_candidates(self, document: dict) -> tuple[bool, str]:
         return self._set("daily_candidates", document["trading_date"], document, essential=True)
+
+    def get_candidates(self, trading_date: str) -> tuple[bool, dict | None]:
+        allowed, message = self.budget.allow(datetime.now(), essential=True)
+        if not allowed:
+            return False, None
+        try:
+            doc = self._collection("daily_candidates").document(trading_date).get(**_FAST_IO)
+            self.budget.note_read()
+            self.budget.note_success()
+            self.budget.save()
+            if doc.exists:
+                data = doc.to_dict() or {}
+                data.setdefault("id", doc.id)
+                return True, data
+            return True, None
+        except Exception as exc:
+            text = public_text(str(exc))
+            self.budget.observe_failure(text, datetime.now())
+            return False, None
+
+    def get_monitoring_state(self, trading_date: str) -> tuple[bool, dict | None]:
+        allowed, message = self.budget.allow(datetime.now(), essential=True)
+        if not allowed:
+            return False, None
+        try:
+            doc = self._collection("monitoring_state").document(trading_date).get(**_FAST_IO)
+            self.budget.note_read()
+            self.budget.note_success()
+            self.budget.save()
+            if doc.exists:
+                data = doc.to_dict() or {}
+                data.setdefault("id", doc.id)
+                return True, data
+            return True, None
+        except Exception as exc:
+            text = public_text(str(exc))
+            self.budget.observe_failure(text, datetime.now())
+            return False, None
+
+    def save_monitoring_state(self, trading_date: str, document: dict) -> tuple[bool, str]:
+        return self._set("monitoring_state", trading_date, document, essential=True)
 
     def signal_exists(self, document_id: str) -> bool:
         allowed, _message = self.budget.allow(datetime.now(), essential=True)

@@ -9,6 +9,14 @@ import pandas as pd
 import streamlit as st
 
 from nse_scanner.cloud_budget import cached_history_rows, cached_reports, load_budget
+from nse_scanner.cloud_scanner import (
+    evaluate_monitoring_cycle,
+    ist_now,
+    lock_and_save_candidates,
+    prepare_candidates_scan,
+    restore_today_state,
+    validate_market_session,
+)
 from nse_scanner.constituents import (
     active_nifty,
     active_sectors,
@@ -78,11 +86,9 @@ def render() -> None:
         )
         st.sidebar.caption("Developer mode")
     status = read_status()
-    if status.get("scanner_state") not in ("running", "waiting", "closed"):
-        st.warning(status.get("message") or "Live scanning is not ready.")
-        failed = [item for item in (status.get("readiness") or {}).get("checks") or [] if not item.get("passed")]
-        for item in failed:
-            st.caption(f"{item.get('name')}: {item.get('detail')}")
+    secrets = secret_status()
+    if not secrets.get("groww_api_key"):
+        st.warning("Groww API credentials are not configured. Add them in Settings or Streamlit Secrets.")
     page = st.sidebar.radio("Sections", PAGES, label_visibility="collapsed")
     st.sidebar.caption("Market clock: Asia/Kolkata")
     {
@@ -134,110 +140,359 @@ def _paint(value: str) -> str:
     return colors.get(value, "")
 
 
-def page_dashboard(status: dict) -> None:
-    board = status.get("board") or {}
-    live = status.get("market") or {}
-    locked_market = (status.get("selection") or {}).get("market") or {}
-    policy = status.get("signal_policy") or {}
-    market = locked_market or live
-    summary = board.get("summary") or {}
-    health = status.get("health") or {}
-    banner = board.get("banner") or market.get("status") or "NO RESULT YET"
-    if live.get("complete") and banner in ("BLOCKED", "WAITING FOR 9:30"):
-        st.subheader(f"Live market: {live.get('status')}")
-    else:
-        st.subheader(f"Market direction: {banner}")
-    reason = status.get("message") or board.get("reason") or "The scanner has not published a result yet."
-    selection_reason = (status.get("selection") or {}).get("reason")
-    if selection_reason and selection_reason not in reason:
-        reason = f"{reason} {selection_reason}"
-    st.write(reason)
-    _cloud_caption()
-    eligibility = policy.get("eligibility") or "Signal eligibility is published after the scanner locks the 9:30 list."
-    if "still scanned" in eligibility:
-        signal_state = "Still scanned"
-    elif "no new signal" in eligibility or "not eligible" in eligibility or "No direction" in eligibility or "No candidate" in eligibility:
-        signal_state = "Not open"
-    else:
-        signal_state = "See note"
-    columns = st.columns(3)
-    columns[0].metric("Locked direction", policy.get("locked_direction") or locked_market.get("direction") or "not locked")
-    columns[1].metric("Live breadth now", policy.get("live_status") or live.get("status") or "unavailable")
-    columns[2].metric("New signals", signal_state)
-    st.caption(eligibility)
-    nifty = market.get("nifty50") or {}
-    fno = market.get("fno") or {}
-    breadth_ready = bool(market.get("complete"))
-    columns = st.columns(4)
-    columns[0].metric("Nifty 50 advances", f"{float(nifty.get('adv_pct')):.1f}%" if breadth_ready else "—")
-    columns[1].metric("F&O advances", f"{float(fno.get('adv_pct')):.1f}%" if breadth_ready else "—")
-    columns[2].metric("Selected", len(summary.get("buy", [])) + len(summary.get("short", [])) + len(summary.get("wait", [])))
-    columns[3].metric("Last update", (status.get("updated_at") or "—")[-8:])
-    columns = st.columns(4)
-    columns[0].metric("BUY", len(summary.get("buy") or []))
-    columns[1].metric("SHORT", len(summary.get("short") or []))
-    columns[2].metric("Waiting", len(summary.get("wait") or []))
-    columns[3].metric("Excluded or blocked", (summary.get("excluded") or 0) + (summary.get("blocked") or 0))
-    st.markdown("**Today's result**")
-    if summary.get("buy"):
-        st.success("BUY / LONG: " + ", ".join(summary["buy"]))
-    if summary.get("short"):
-        st.error("SHORT: " + ", ".join(summary["short"]))
-    if summary.get("wait"):
-        st.info("WAIT: " + ", ".join(summary["wait"]))
-    if banner == "NO TRADE":
-        st.warning("NO TRADE. " + (board.get("reason") or "The market gate did not confirm one direction."))
-    if not summary.get("buy") and not summary.get("short"):
-        st.info("No qualifying trade signals at this time.")
-    _market_block(market if market else None, "Market breadth used for the decision")
-    rows = board.get("rows") or []
-    st.subheader("Stock results")
-    if not rows:
-        st.caption(board.get("reason") or "No stock list is available for this decision. Sample stocks are not shown.")
-    else:
-        choice = st.selectbox("Show", ["BUY, SHORT and WAIT", "All decisions", "BUY", "SHORT", "WAIT", "EXCLUDED", "BLOCKED"])
-        visible = rows
-        if choice == "BUY, SHORT and WAIT":
-            visible = [row for row in rows if row["Final Decision"] in ("BUY", "SHORT", "WAIT")]
-        elif choice != "All decisions":
-            visible = [row for row in rows if row["Final Decision"] == choice]
-        frame = pd.DataFrame(visible)
-        hidden = [column for column in ("checks", "proof") if column in frame.columns]
-        shown = frame.drop(columns=hidden) if len(frame) else frame
-        if len(shown) and "Final Decision" in shown.columns:
-            styled = shown.style.map(_paint, subset=["Final Decision"])
-            st.dataframe(styled, width="stretch", hide_index=True)
+@st.fragment(run_every=30)
+def _monitoring_fragment(client, store, locked_candidates, settings) -> None:
+    now = ist_now()
+    trading_date = str(now.date())
+    cutoff_time = parse_clock(settings.get("setup3_end", "11:00"))
+    is_active = st.session_state.get("monitoring_active", False)
+    cutoff_reached = now.time().replace(microsecond=0) >= cutoff_time.replace(microsecond=0)
+
+    if is_active:
+        if cutoff_reached:
+            st.session_state["monitoring_active"] = False
+            mon_state = st.session_state.get("monitoring_state") or {}
+            mon_state["state"] = "COMPLETED"
+            mon_state["cutoff_reached"] = True
+            st.session_state["monitoring_state"] = mon_state
+            if store is not None:
+                try:
+                    store.save_monitoring_state(trading_date, mon_state)
+                except Exception:
+                    pass
+            st.info("11:00 AM IST cutoff reached. Monitoring window completed.")
         else:
-            st.dataframe(shown, width="stretch", hide_index=True)
-        st.download_button(
-            "Download this table as CSV",
-            shown.to_csv(index=False) if len(shown) else "Symbol\n",
-            file_name="nse_fno_stock_results.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-        if visible:
-            symbol = st.selectbox("Inspect one stock", [row["Symbol"] for row in visible])
-            chosen = next(row for row in visible if row["Symbol"] == symbol)
-            st.markdown(f"**{chosen['Symbol']} — {chosen['Final Decision']}**")
-            st.write(chosen["Reason"])
-            proof = pd.DataFrame([
-                {
-                    "Strategy check": item.get("label"),
-                    "Observed value": item.get("actual"),
-                    "Required condition": item.get("required"),
-                    "Result": item.get("mark"),
-                }
-                for item in chosen.get("checks") or []
-            ])
-            st.dataframe(proof, width="stretch", hide_index=True)
-            for line in chosen.get("proof") or []:
-                st.caption(line)
-    st.caption(
-        f"Data connection: {health.get('database') or 'not connected'} · "
-        f"Feed: {health.get('feed') or 'not started'} · "
-        f"Updated: {status.get('updated_at') or '—'}"
+            eval_res = evaluate_monitoring_cycle(
+                client, store, locked_candidates, now, settings,
+                known_ids=st.session_state.get("known_ids"),
+            )
+            st.session_state["board"] = eval_res.get("board")
+            st.session_state["signals"] = eval_res.get("signals")
+            st.session_state["monitoring_state"] = eval_res.get("monitoring_state")
+            if eval_res.get("gap_detected"):
+                st.session_state["gap_message"] = eval_res.get("gap_message")
+
+    mon = st.session_state.get("monitoring_state") or {}
+    c1, c2, c3 = st.columns(3)
+    state_str = "ACTIVE (30s refresh)" if is_active else ("COMPLETED (11:00 Cutoff)" if cutoff_reached else "PAUSED")
+    c1.metric("Monitoring State", state_str)
+    c2.metric("Last Data Update", (mon.get("last_data_update") or "—")[-8:])
+    c3.metric("Last Candle Evaluated", (mon.get("last_monitored_candle") or "—")[-8:])
+
+
+def page_dashboard(status: dict) -> None:
+    now = ist_now()
+    trading_date = str(now.date())
+    settings = load_settings()
+    store = _store_or_none()
+    client = GrowwClient(settings)
+
+    # Initialize session state keys
+    st.session_state.setdefault("prepared_data", None)
+    st.session_state.setdefault("locked_candidates", None)
+    st.session_state.setdefault("monitoring_active", False)
+    st.session_state.setdefault("monitoring_state", None)
+    st.session_state.setdefault("board", None)
+    st.session_state.setdefault("signals", [])
+    st.session_state.setdefault("known_ids", set())
+    st.session_state.setdefault("gap_message", "")
+    st.session_state.setdefault("last_scan_error", "")
+
+    # Multi-client Firestore state restoration (Odisha client & Maharashtra admin)
+    if st.session_state.get("last_synced_date") != trading_date:
+        restored = restore_today_state(store, trading_date)
+        if restored.get("locked"):
+            st.session_state["locked_candidates"] = restored["locked"]
+        if restored.get("monitoring_state"):
+            mon = restored["monitoring_state"]
+            st.session_state["monitoring_state"] = mon
+            if mon.get("state") == "MONITORING":
+                st.session_state["monitoring_active"] = True
+            elif mon.get("state") == "COMPLETED":
+                st.session_state["monitoring_active"] = False
+        if restored.get("signals"):
+            st.session_state["signals"] = restored["signals"]
+            for s in restored["signals"]:
+                if s.get("id"):
+                    st.session_state["known_ids"].add(s["id"])
+        st.session_state["last_synced_date"] = trading_date
+
+    locked_candidates = st.session_state.get("locked_candidates")
+    prepared_data = st.session_state.get("prepared_data")
+    monitoring_active = st.session_state.get("monitoring_active", False)
+    monitoring_state = st.session_state.get("monitoring_state") or {}
+
+    cutoff_reached = monitoring_state.get("cutoff_reached") or (now.time().replace(microsecond=0) >= parse_clock(settings.get("setup3_end", "11:00")).replace(microsecond=0))
+
+    # Determine status badge
+    if cutoff_reached and locked_candidates:
+        current_badge = "COMPLETED"
+        badge_color = "#059669"
+        badge_desc = "11:00 AM IST cutoff reached. Monitoring complete for today."
+    elif monitoring_active:
+        current_badge = "MONITORING"
+        badge_color = "#16a34a"
+        badge_desc = "Setup evaluation running every 30s on completed 5-min candles."
+    elif locked_candidates:
+        current_badge = "LOCKED"
+        badge_color = "#0284c7"
+        badge_desc = f"Candidate list locked for {trading_date}. Ready for setup monitoring."
+    elif prepared_data:
+        current_badge = "PREPARED"
+        badge_color = "#9333ea"
+        badge_desc = "Candidates prepared from live scan. Click SAVE CANDIDATES to lock."
+    elif st.session_state.get("last_scan_error"):
+        current_badge = "ERROR"
+        badge_color = "#dc2626"
+        badge_desc = st.session_state["last_scan_error"]
+    else:
+        current_badge = "READY"
+        badge_color = "#4b5563"
+        badge_desc = "Ready for candidate scan. At ~9:30 AM IST, click SCAN STOCKS."
+
+    # Render top Status Bar
+    st.markdown(
+        f"""
+        <div style="background-color: {badge_color}12; border-left: 5px solid {badge_color}; padding: 12px 18px; border-radius: 6px; margin-bottom: 20px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                <div>
+                    <span style="background-color: {badge_color}; color: white; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; letter-spacing: 0.05em;">{current_badge}</span>
+                    <span style="margin-left: 12px; font-weight: 500; color: #1e293b;">{badge_desc}</span>
+                </div>
+                <div style="color: #64748b; font-size: 0.85rem; font-family: monospace;">
+                    {trading_date} · {now.strftime('%H:%M:%S IST')} · Cloud Sync Active
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+
+    if st.session_state.get("gap_message"):
+        st.warning(st.session_state["gap_message"])
+
+    # -------------------------------------------------------------
+    # PHASE A: SCAN STOCKS
+    # -------------------------------------------------------------
+    st.markdown("### Phase A: Prepare Candidates")
+    if locked_candidates:
+        st.info(f"Candidate list is LOCKED for trading day {trading_date}. Overwrite is blocked.")
+    else:
+        col_scan, col_info = st.columns([1, 2])
+        with col_scan:
+            scan_clicked = st.button("SCAN STOCKS", type="primary", use_container_width=True)
+        with col_info:
+            st.caption("Validates market time (~9:30 AM IST), authenticates with Groww, calculates 60/40 market breadth, and filters top movers <= 5%.")
+
+        if scan_clicked:
+            st.session_state["last_scan_error"] = ""
+            prog = st.progress(0, text="Initializing market scan...")
+            def _progress_cb(pct, text):
+                prog.progress(pct, text=text)
+
+            res = prepare_candidates_scan(client, store, settings, now, progress_callback=_progress_cb)
+            if res.get("valid"):
+                st.session_state["prepared_data"] = res
+                st.session_state["last_scan_error"] = ""
+                st.success("Candidate scan completed successfully! Review candidates below.")
+                st.rerun()
+            else:
+                err = res.get("error") or "Unknown error occurred during scan."
+                st.session_state["last_scan_error"] = err
+                st.error(err)
+
+    # -------------------------------------------------------------
+    # PHASE B: SAVE CANDIDATES
+    # -------------------------------------------------------------
+    if prepared_data and not locked_candidates:
+        st.markdown("---")
+        st.markdown("### Phase B: Review & Save Candidates")
+
+        market = prepared_data.get("market") or {}
+        st.subheader(f"Market Breadth: {market.get('status') or 'UNKNOWN'}")
+        st.write(market.get("reason") or "")
+
+        _market_block(market, "Market Breadth Summary")
+
+        st.markdown("#### Candidate List (Unsaved Snapshot)")
+        cand_list = prepared_data.get("candidates") or []
+        if cand_list:
+            cand_df = pd.DataFrame(cand_list)
+            keep_cols = [c for c in ["symbol", "name", "ltp", "change_pct", "sources", "current_price_status", "data_updated"] if c in cand_df.columns]
+            st.dataframe(cand_df[keep_cols], use_container_width=True, hide_index=True)
+        else:
+            st.warning("No eligible candidates found. Market direction might be Neutral/Opposite or all candidates exceeded 5% move.")
+
+        # Method status explanations
+        st.markdown("**Stock Selection Methods Status:**")
+        st.write("- **Method 1 (Top F&O Movers):** Active. Evaluates top 5 gainers (BULLISH) or top 5 losers (BEARISH) within 5% move cap.")
+        st.write("- **Method 2 (Sector Movers):** **BLOCKED**. Missing verified Groww index prices for required sectors (Energy, India Defence).")
+        st.write("- **Method 3 (NSE-wide Movers):** **BLOCKED**. Requires authorized NSE-wide ranking feed.")
+        st.write("- **Filter Rule:** Maximum absolute daily movement <= 5.0%.")
+
+        direction = market.get("direction")
+        can_save = bool(direction and cand_list and market.get("status") in ("BULLISH", "BEARISH"))
+
+        col_save, col_save_info = st.columns([1, 2])
+        with col_save:
+            save_clicked = st.button("SAVE CANDIDATES", type="primary", disabled=not can_save, use_container_width=True)
+        with col_save_info:
+            if not can_save:
+                st.caption("SAVE CANDIDATES is disabled because market direction is not BULLISH/BEARISH or candidate list is empty.")
+            else:
+                st.caption("Locks candidate list in Firestore for the trading day. Cannot be overwritten.")
+
+        if save_clicked and can_save:
+            ok, msg, locked_doc = lock_and_save_candidates(store, prepared_data, now, settings)
+            if ok:
+                st.session_state["locked_candidates"] = locked_doc
+                st.session_state["prepared_data"] = None
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    # -------------------------------------------------------------
+    # PHASE C: SETUP MONITORING
+    # -------------------------------------------------------------
+    if locked_candidates:
+        st.markdown("---")
+        st.markdown("### Phase C: Setup Monitoring")
+        locked_market = locked_candidates.get("market") or {}
+        locked_dir = locked_candidates.get("direction") or "NONE"
+        locked_time = locked_candidates.get("locked_at") or "—"
+        locked_count = len(locked_candidates.get("candidates") or [])
+
+        st.caption(f"Locked Direction: **{locked_dir}** · Locked At: **{locked_time}** · Candidates: **{locked_count}** · Cutoff: **11:00 AM IST**")
+
+        col_mon1, col_mon2 = st.columns(2)
+        with col_mon1:
+            if cutoff_reached:
+                st.button("MONITORING COMPLETED", disabled=True, use_container_width=True)
+            elif not monitoring_active:
+                if st.button("START MONITORING", type="primary", use_container_width=True):
+                    st.session_state["monitoring_active"] = True
+                    st.rerun()
+            else:
+                if st.button("PAUSE MONITORING", use_container_width=True):
+                    st.session_state["monitoring_active"] = False
+                    st.rerun()
+
+        with col_mon2:
+            if st.button("EVALUATE NOW (Manual Refresh)", use_container_width=True):
+                eval_res = evaluate_monitoring_cycle(
+                    client, store, locked_candidates, now, settings,
+                    known_ids=st.session_state["known_ids"],
+                )
+                st.session_state["board"] = eval_res.get("board")
+                st.session_state["signals"] = eval_res.get("signals")
+                st.session_state["monitoring_state"] = eval_res.get("monitoring_state")
+                if eval_res.get("gap_detected"):
+                    st.session_state["gap_message"] = eval_res.get("gap_message")
+                st.success("Evaluation cycle completed.")
+                st.rerun()
+
+        # Dynamic Fragment for 30s Periodic Auto-refresh
+        _monitoring_fragment(client, store, locked_candidates, settings)
+
+    # -------------------------------------------------------------
+    # PHASE D: FINAL RESULTS & INSPECTOR
+    # -------------------------------------------------------------
+    if locked_candidates:
+        st.markdown("---")
+        st.markdown("### Phase D: Final Results & Signals")
+
+        # If board not built yet, build initial board
+        board = st.session_state.get("board")
+        if not board:
+            board = build_board(
+                locked_candidates.get("market") or {},
+                locked_candidates.get("candidates") or [],
+                locked_candidates.get("considered") or [],
+                st.session_state.get("signals") or [],
+                locked_candidates.get("notes") or {},
+                trading_date,
+                data_updated=now.strftime("%Y-%m-%d %H:%M:%S"),
+                locked=True,
+            )
+            st.session_state["board"] = board
+
+        summary = board.get("summary") or {}
+        cols = st.columns(5)
+        cols[0].metric("BUY / LONG", len(summary.get("buy") or []))
+        cols[1].metric("SHORT", len(summary.get("short") or []))
+        cols[2].metric("WAITING", len(summary.get("wait") or []))
+        cols[3].metric("EXCLUDED", summary.get("excluded", 0))
+        cols[4].metric("BLOCKED", summary.get("blocked", 0))
+
+        if summary.get("buy"):
+            st.success("BUY / LONG: " + ", ".join(summary["buy"]))
+        if summary.get("short"):
+            st.error("SHORT: " + ", ".join(summary["short"]))
+        if summary.get("wait"):
+            st.info("WAIT: " + ", ".join(summary["wait"]))
+        if not summary.get("buy") and not summary.get("short"):
+            st.info("No BUY or SHORT triggers yet. Candidates are waiting for qualifying candle setups.")
+
+        _market_block(locked_candidates.get("market"), "Locked Market Breadth")
+
+        rows = board.get("rows") or []
+        st.subheader("Decision Board")
+        if rows:
+            choice = st.selectbox("Filter Decisions", ["BUY, SHORT and WAIT", "All decisions", "BUY", "SHORT", "WAIT", "EXCLUDED", "BLOCKED"], key="filter_decision_choice")
+            visible = rows
+            if choice == "BUY, SHORT and WAIT":
+                visible = [r for r in rows if r["Final Decision"] in ("BUY", "SHORT", "WAIT")]
+            elif choice != "All decisions":
+                visible = [r for r in rows if r["Final Decision"] == choice]
+
+            frame = pd.DataFrame(visible)
+            hidden = [col for col in ("checks", "proof") if col in frame.columns]
+            shown = frame.drop(columns=hidden) if len(frame) else frame
+            if len(shown) and "Final Decision" in shown.columns:
+                styled = shown.style.map(_paint, subset=["Final Decision"])
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(shown, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "Download this table as CSV",
+                shown.to_csv(index=False) if len(shown) else "Symbol\n",
+                file_name=f"nse_fno_decisions_{trading_date}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+            if visible:
+                symbol = st.selectbox("Inspect one stock", [r["Symbol"] for r in visible], key="inspect_stock_choice")
+                chosen = next(r for r in visible if r["Symbol"] == symbol)
+                st.markdown(f"**{chosen['Symbol']} — {chosen['Final Decision']}**")
+                st.write(chosen["Reason"])
+                proof = pd.DataFrame([
+                    {
+                        "Strategy check": item.get("label"),
+                        "Observed value": item.get("actual"),
+                        "Required condition": item.get("required"),
+                        "Result": item.get("mark"),
+                    }
+                    for item in chosen.get("checks") or []
+                ])
+                st.dataframe(proof, use_container_width=True, hide_index=True)
+                for line in chosen.get("proof") or []:
+                    st.caption(line)
+
+        # Signals History Table
+        all_signals = st.session_state.get("signals") or []
+        st.subheader(f"Stored Live Signals ({len(all_signals)})")
+        if all_signals:
+            sig_frame = pd.DataFrame(all_signals)
+            sig_cols = [c for c in ["symbol", "direction", "setup", "candle_time", "open", "high", "low", "close", "volume", "sources"] if c in sig_frame.columns]
+            st.dataframe(sig_frame[sig_cols], use_container_width=True, hide_index=True)
+        else:
+            st.caption("No signals triggered yet today.")
+
+    _cloud_caption()
+    st.caption(f"App Active · Session Date: {trading_date} · Signals only. No automatic trading.")
 
 
 def page_checklist(status: dict) -> None:
