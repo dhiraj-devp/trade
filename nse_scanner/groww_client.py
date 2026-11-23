@@ -242,11 +242,35 @@ class GrowwClient:
         return _probe("Streaming feed", True, "success", message + " No tick was stored as a live price by this check.")
 
     def download_instruments(self):
+        """Download the Groww instrument file in memory.
+
+        The SDK writes instruments.csv inside its own package directory. That
+        directory is read-only on Streamlit Cloud, so the file is parsed here
+        and never saved beside the installed package.
+        """
         if self.api is None:
             ok, message = self.authenticate()
             if not ok:
                 raise RuntimeError(message)
-        return self._call(self.history_limiter, "get_all_instruments")
+        import io
+
+        import pandas as pd
+        import requests
+
+        self.history_limiter.wait()
+        try:
+            response = requests.get(
+                "https://growwapi-assets.groww.in/instruments/instrument.csv",
+                timeout=60,
+            )
+            response.raise_for_status()
+            frame = pd.read_csv(io.BytesIO(response.content), dtype="str")
+        except Exception as exc:
+            self.api_failures += 1
+            self.last_error = public_text(str(exc))
+            raise
+        self.last_success = datetime.now().isoformat(timespec="seconds")
+        return frame
 
     def get_ltp_batch(self, exchange_symbols: list[str]) -> dict:
         prices = {}
@@ -361,6 +385,8 @@ def classify_probe_failure(message: str) -> str:
     text = (message or "").lower()
     if any(phrase in text for phrase in ("not configured", "did not return an access token", "sdk is not installed")):
         return "authentication"
+    if "errno 13" in text or "site-packages" in text or "instruments.csv" in text:
+        return "request_failed"
     if any(phrase in text for phrase in ("forbidden", "permission", "authorisation failed", "authorization failed", "not subscribed", "entitlement")):
         return "permission_denied"
     return "request_failed"

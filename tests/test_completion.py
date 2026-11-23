@@ -244,6 +244,7 @@ def test_permission_probe_does_not_treat_forbidden_data_as_a_failed_login():
         raise RuntimeError("Access forbidden for this request")
 
     client._call = forbidden
+    client.download_instruments = forbidden
     results = {row["name"]: row for row in client.probe_permissions()}
     assert results["Authentication"]["ok"] is True
     assert results["Live LTP"]["category"] == "permission_denied"
@@ -251,10 +252,35 @@ def test_permission_probe_does_not_treat_forbidden_data_as_a_failed_login():
     assert results["Historical 5-minute candles"]["category"] == "permission_denied"
     assert results["Open interest"]["category"] == "not_tested"
     assert classify_probe_failure("Groww API key is not configured.") == "authentication"
+    assert classify_probe_failure(
+        "[Errno 13] Permission denied: '/home/adminuser/venv/lib/python3.14/site-packages/growwapi/instruments.csv'"
+    ) == "request_failed"
     client.authenticate = lambda: (False, "Groww API key is not configured.")
     failed = client.probe_permissions()
     assert failed[0]["ok"] is False
     assert all(row["category"] == "not_tested" for row in failed[1:])
+
+
+def test_instrument_master_is_loaded_without_writing_the_package_directory(monkeypatch):
+    from nse_scanner.groww_client import GrowwClient
+
+    client = GrowwClient({}, sleep=lambda _seconds: None)
+    client.api = type("Api", (), {})()
+
+    class Response:
+        content = b"trading_symbol,exchange,segment\nRELIANCE,NSE,CASH\n"
+
+        def raise_for_status(self):
+            return None
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("get_all_instruments must not write inside the Groww package")
+
+    monkeypatch.setattr("requests.get", lambda *_args, **_kwargs: Response())
+    client.api.get_all_instruments = fail_if_called
+    frame = client.download_instruments()
+    assert list(frame["trading_symbol"]) == ["RELIANCE"]
+    assert client.api_failures == 0
 
 
 def _fno_rows(moves):
